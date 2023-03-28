@@ -1,0 +1,25 @@
+[package]
+name = "bolt-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bolt-server"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+byteordered = "0.6.0"
+log = "0.4"
+env_logger = "0.10"
+tokio = { version = "1", features = ["full"] }
+logger = { path = "../logger" }
+server = { path = "../server" }
+
+# Optimized memory allocator (used by Redis, Firefox, etc.)
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[profile.release]
+lto = true
+panic = "abort"
