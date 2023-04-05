@@ -2,6 +2,7 @@
 members = [
     "src/bolt",
     "src/logger",
+    "src/server",
 ]
 resolver = "2"
 
