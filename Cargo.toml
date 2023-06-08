@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "src/bolt",
+    "src/ctl",
     "src/logger",
     "src/server",
     "src/storage",
