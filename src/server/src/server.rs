@@ -1,8 +1,10 @@
 use storage::{Storage, StorageConfig, DatabaseId};
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use log::info;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tokio::io::{AsyncRead, AsyncWrite};
 use crate::error::ServerError;
 use crate::message::Message;
@@ -53,28 +55,60 @@ impl Server {
 
         info!("BOLT is running on {} (TCP, standalone) ...", addr);
 
-        // Store a reference for background tasks
-        let _storage_ref = Arc::new(self.storage.clone());
+        // Start TTL cleanup background task
+        let storage_clone = Arc::new(self.storage.clone());
+        let ttl_cleanup_interval = env::var("BOLT_TTL_CLEANUP_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60u64);
+        Storage::start_ttl_cleanup(storage_clone.clone(), Duration::from_secs(ttl_cleanup_interval));
+        info!("TTL cleanup interval: {}s", ttl_cleanup_interval);
+
+        // Shutdown broadcast channel
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        // Spawn signal handler
+        let shutdown_tx_clone = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                info!("Failed to listen for shutdown signal: {}", e);
+                return;
+            }
+            info!("Received shutdown signal, stopping server...");
+            let _ = shutdown_tx_clone.send(());
+        });
 
         loop {
-            match listener.accept().await {
-                Ok((stream, peer_addr)) => {
-                    let storage = self.storage.clone();
+            let mut shutdown_rx = shutdown_tx.subscribe();
 
-                    info!("New connection from {}", peer_addr);
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer_addr)) => {
+                            let storage = self.storage.clone();
+                            let mut client_shutdown_rx = shutdown_tx.subscribe();
 
-                    tokio::spawn(async move {
-                        let result = handle_client(stream, storage).await;
+                            info!("New connection from {}", peer_addr);
 
-                        if let Err(e) = result {
-                            info!("Connection closed from {}: {}", peer_addr, e);
-                        } else {
-                            info!("Connection closed from {}", peer_addr);
+                            tokio::spawn(async move {
+                                let result = handle_client(stream, storage, &mut client_shutdown_rx).await;
+
+                                if let Err(e) = result {
+                                    info!("Connection closed from {}: {}", peer_addr, e);
+                                } else {
+                                    info!("Connection closed from {}", peer_addr);
+                                }
+                            });
                         }
-                    });
+                        Err(e) => {
+                            info!("Failed to accept connection: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    info!("Failed to accept connection: {}", e);
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received, stopping server...");
+                    info!("BOLT server stopped");
+                    return Ok(());
                 }
             }
         }
@@ -84,23 +118,31 @@ impl Server {
 async fn handle_client<S>(
     mut stream: S,
     storage: Storage,
+    shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Process messages in a loop until the client disconnects
     loop {
-        match Message::receive_async(&mut stream).await {
-            Ok(message) => {
-                if let Err(e) = process_message(&message, &storage, &mut stream).await {
-                    return Err(e);
+        tokio::select! {
+            result = Message::receive_async(&mut stream) => {
+                match result {
+                    Ok(message) => {
+                        if let Err(e) = process_message(&message, &storage, &mut stream).await {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            return Ok(());
+                        }
+                        return Err(e);
+                    }
                 }
             }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return Ok(());
-                }
-                return Err(e);
+            _ = shutdown_rx.recv() => {
+                info!("Client handler received shutdown signal");
+                return Ok(());
             }
         }
     }
@@ -132,6 +174,73 @@ where
                 value: value.clone(),
                 not_found: false,
                 database_id: message.database_id.clone(),
+            };
+            response.send_async(stream).await?;
+        }
+        OP_SETEX => {
+            // SET with TTL: key contains the key, value contains "ttl_seconds:actual_value"
+            let key = &message.key;
+
+            // Parse TTL from value (format: "ttl_seconds:value")
+            let (ttl_secs, actual_value) = if let Some(colon_pos) = message.value.find(':') {
+                let ttl_str = &message.value[..colon_pos];
+                let value = &message.value[colon_pos + 1..];
+                let ttl = ttl_str.parse::<u64>().unwrap_or(0);
+                (ttl, value.to_string())
+            } else {
+                (0, message.value.clone())
+            };
+
+            let ttl = if ttl_secs > 0 {
+                Some(Duration::from_secs(ttl_secs))
+            } else {
+                None
+            };
+
+            storage.set_with_ttl(message.database_id.clone(), key, &actual_value, ttl).await;
+
+            info!("OK SETEX {} {} (TTL: {}s)", key, actual_value, ttl_secs);
+
+            // Send response back to client
+            let response = Message {
+                code: OP_SETEX,
+                key: key.clone(),
+                value: actual_value,
+                not_found: false,
+                database_id: message.database_id.clone(),
+            };
+            response.send_async(stream).await?;
+        }
+        OP_TTL => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let ttl = storage.get_ttl(database_id.clone(), key).await;
+
+            let response = match ttl {
+                Some(Some(secs)) => {
+                    info!("OK TTL {} = {}s", key, secs);
+                    Message {
+                        code: OP_TTL,
+                        key: key.clone(),
+                        value: secs.to_string(),
+                        not_found: false,
+                        database_id,
+                    }
+                }
+                Some(None) => {
+                    info!("OK TTL {} = -1 (no expiration)", key);
+                    Message {
+                        code: OP_TTL,
+                        key: key.clone(),
+                        value: "-1".to_string(),
+                        not_found: false,
+                        database_id,
+                    }
+                }
+                None => {
+                    info!("ERR KEY_NOT_FOUND: {}", key);
+                    Message::not_found_response()
+                }
             };
             response.send_async(stream).await?;
         }
@@ -171,6 +280,68 @@ where
             };
             response.send_async(stream).await?;
         }
+        OP_MGET => {
+            // Batch GET: keys are separated by newlines in the key field
+            let keys: Vec<String> = message.key.split('\n').map(|s| s.to_string()).collect();
+            let database_id = message.database_id.clone();
+            let values = storage.mget(database_id.clone(), &keys).await;
+
+            // Return values as newline-separated, with empty string for missing keys
+            let result: String = values.iter()
+                .map(|v| v.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            info!("OK MGET {} keys", keys.len());
+            let response = Message {
+                code: OP_MGET,
+                key: message.key.clone(),
+                value: result,
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_MSET => {
+            // Batch SET: key field contains "key1\nkey2\n...", value field contains "val1\nval2\n..."
+            let keys: Vec<&str> = message.key.split('\n').collect();
+            let values: Vec<&str> = message.value.split('\n').collect();
+            let database_id = message.database_id.clone();
+
+            let pairs: Vec<(String, String)> = keys.iter()
+                .zip(values.iter())
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+
+            storage.mset(database_id.clone(), &pairs).await;
+
+            info!("OK MSET {} pairs", pairs.len());
+
+            let response = Message {
+                code: OP_MSET,
+                key: String::new(),
+                value: pairs.len().to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_MDEL => {
+            // Batch DELETE: keys are separated by newlines in the key field
+            let keys: Vec<String> = message.key.split('\n').map(|s| s.to_string()).collect();
+            let database_id = message.database_id.clone();
+            let deleted = storage.mdel(database_id.clone(), &keys).await;
+
+            info!("OK MDEL {} keys (deleted {})", keys.len(), deleted);
+            let response = Message {
+                code: OP_MDEL,
+                key: String::new(),
+                value: deleted.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
         OP_DEL => {
             let key = &message.key;
             let database_id = message.database_id.clone();
@@ -195,9 +366,10 @@ where
             response.send_async(stream).await?;
         }
         OP_STATS => {
-            // Basic stats - just uptime for now
+            let uptime_secs = 0u64; // Basic stats without metrics struct
             let stats_json = format!(
-                r#"{{"version":"0.1.0","status":"running"}}"#,
+                r#"{{"uptime_seconds":{}}}"#,
+                uptime_secs,
             );
             info!("STATS requested");
             let response = Message {
