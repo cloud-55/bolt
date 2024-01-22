@@ -381,6 +381,242 @@ where
             };
             response.send_async(stream).await?;
         }
+        // Counter operations
+        OP_INCR => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let new_value = storage.incr(database_id.clone(), key).await;
+
+            info!("OK INCR {} = {}", key, new_value);
+            let response = Message {
+                code: OP_INCR,
+                key: key.clone(),
+                value: new_value.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_DECR => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let new_value = storage.decr(database_id.clone(), key).await;
+
+            info!("OK DECR {} = {}", key, new_value);
+            let response = Message {
+                code: OP_DECR,
+                key: key.clone(),
+                value: new_value.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_INCRBY => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let delta: i64 = message.value.parse().unwrap_or(0);
+            let new_value = storage.incr_by(database_id.clone(), key, delta).await;
+
+            info!("OK INCRBY {} {} = {}", key, delta, new_value);
+            let response = Message {
+                code: OP_INCRBY,
+                key: key.clone(),
+                value: new_value.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        // List operations
+        OP_LPUSH => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let values: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
+            let len = storage.lpush(database_id.clone(), key, &values).await;
+
+            info!("OK LPUSH {} {} values = {}", key, values.len(), len);
+            let response = Message {
+                code: OP_LPUSH,
+                key: key.clone(),
+                value: len.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_RPUSH => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let values: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
+            let len = storage.rpush(database_id.clone(), key, &values).await;
+
+            info!("OK RPUSH {} {} values = {}", key, values.len(), len);
+            let response = Message {
+                code: OP_RPUSH,
+                key: key.clone(),
+                value: len.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_LPOP => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let value = storage.lpop(database_id.clone(), key).await;
+
+            let response = match value {
+                Some(v) => {
+                    info!("OK LPOP {} = {}", key, v);
+                    Message {
+                        code: OP_LPOP,
+                        key: key.clone(),
+                        value: v,
+                        not_found: false,
+                        database_id,
+                    }
+                }
+                None => {
+                    info!("OK LPOP {} = (empty)", key);
+                    Message::not_found_response()
+                }
+            };
+            response.send_async(stream).await?;
+        }
+        OP_RPOP => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let value = storage.rpop(database_id.clone(), key).await;
+
+            let response = match value {
+                Some(v) => {
+                    info!("OK RPOP {} = {}", key, v);
+                    Message {
+                        code: OP_RPOP,
+                        key: key.clone(),
+                        value: v,
+                        not_found: false,
+                        database_id,
+                    }
+                }
+                None => {
+                    info!("OK RPOP {} = (empty)", key);
+                    Message::not_found_response()
+                }
+            };
+            response.send_async(stream).await?;
+        }
+        OP_LRANGE => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            // Parse start:stop from value
+            let parts: Vec<&str> = message.value.split(':').collect();
+            let start: i64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let stop: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(-1);
+            let values = storage.lrange(database_id.clone(), key, start, stop).await;
+            let result = values.join("\n");
+            info!("OK LRANGE {} {}:{} = {} items", key, start, stop, values.len());
+            let response = Message {
+                code: OP_LRANGE,
+                key: key.clone(),
+                value: result,
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_LLEN => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let len = storage.llen(database_id.clone(), key).await;
+            info!("OK LLEN {} = {}", key, len);
+            let response = Message {
+                code: OP_LLEN,
+                key: key.clone(),
+                value: len.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        // Set operations
+        OP_SADD => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let members: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
+            let added = storage.sadd(database_id.clone(), key, &members).await;
+
+            info!("OK SADD {} {} members, {} added", key, members.len(), added);
+            let response = Message {
+                code: OP_SADD,
+                key: key.clone(),
+                value: added.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_SREM => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let members: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
+            let removed = storage.srem(database_id.clone(), key, &members).await;
+
+            info!("OK SREM {} {} members, {} removed", key, members.len(), removed);
+            let response = Message {
+                code: OP_SREM,
+                key: key.clone(),
+                value: removed.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_SMEMBERS => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let members = storage.smembers(database_id.clone(), key).await;
+            let result = members.join("\n");
+            info!("OK SMEMBERS {} = {} members", key, members.len());
+            let response = Message {
+                code: OP_SMEMBERS,
+                key: key.clone(),
+                value: result,
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_SCARD => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let size = storage.scard(database_id.clone(), key).await;
+            info!("OK SCARD {} = {}", key, size);
+            let response = Message {
+                code: OP_SCARD,
+                key: key.clone(),
+                value: size.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_SISMEMBER => {
+            let key = &message.key;
+            let member = &message.value;
+            let database_id = message.database_id.clone();
+            let exists = storage.sismember(database_id.clone(), key, member).await;
+            info!("OK SISMEMBER {} {} = {}", key, member, exists);
+            let response = Message {
+                code: OP_SISMEMBER,
+                key: key.clone(),
+                value: if exists { "1" } else { "0" }.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
         // Utility operations
         OP_EXISTS => {
             let key = &message.key;
@@ -393,6 +629,34 @@ where
                 value: if exists { "1" } else { "0" }.to_string(),
                 not_found: false,
                 database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_TYPE => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let key_type = storage.key_type(database_id.clone(), key).await;
+            let response = match key_type {
+                Some(t) => {
+                    info!("OK TYPE {} = {}", key, t);
+                    Message {
+                        code: OP_TYPE,
+                        key: key.clone(),
+                        value: t.to_string(),
+                        not_found: false,
+                        database_id,
+                    }
+                }
+                None => {
+                    info!("OK TYPE {} = none", key);
+                    Message {
+                        code: OP_TYPE,
+                        key: key.clone(),
+                        value: "none".to_string(),
+                        not_found: true,
+                        database_id,
+                    }
+                }
             };
             response.send_async(stream).await?;
         }
