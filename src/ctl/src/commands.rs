@@ -51,3 +51,4 @@ pub const COMMAND_USER_PASSWD: &str = "passwd";
 pub const COMMAND_USER_ROLE: &str = "role";
 pub const COMMAND_WHOAMI: &str = "whoami";
 
+
