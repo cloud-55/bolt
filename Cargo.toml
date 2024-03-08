@@ -2,9 +2,10 @@
 members = [
     "src/bolt",
     "src/ctl",
-    "src/logger",
+    "src/bench",
     "src/server",
     "src/storage",
+    "src/logger",
 ]
 resolver = "2"
 

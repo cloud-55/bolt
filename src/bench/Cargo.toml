@@ -1,0 +1,14 @@
+[package]
+name = "bolt-bench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "bolt-bench"
+path = "src/main.rs"
+
+[dependencies]
+storage = { path = "../storage" }
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
