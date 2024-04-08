@@ -6,6 +6,7 @@ members = [
     "src/server",
     "src/storage",
     "src/logger",
+    "src/cluster",
 ]
 resolver = "2"
 
