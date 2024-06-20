@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Mutex, broadcast, mpsc};
@@ -11,6 +11,9 @@ use crate::config::ClusterConfig;
 use crate::types::*;
 use crate::replication::{ReplicationEntry, ReplicationOp};
 
+/// Maximum pending replication entries per peer before dropping oldest
+const MAX_PENDING_PER_PEER: usize = 50000;
+
 /// Cluster manager handles all cluster operations
 pub struct ClusterManager {
     config: ClusterConfig,
@@ -19,11 +22,19 @@ pub struct ClusterManager {
     peers: Arc<RwLock<HashMap<String, PeerNode>>>,
     /// Persistent connections to peers (addr -> connection)
     peer_connections: Arc<Mutex<HashMap<String, PeerConnection>>>,
+    /// Pending replication entries per peer (peer_id -> queue)
+    pending_replication: Arc<RwLock<HashMap<String, VecDeque<ReplicationEntry>>>>,
     storage: Storage,
     sequence: Arc<std::sync::atomic::AtomicU64>,
     last_applied_sequence: Arc<std::sync::atomic::AtomicU64>,
     replication_tx: mpsc::Sender<ReplicationEntry>,
     shutdown_tx: broadcast::Sender<()>,
+    /// Metrics: total drain operations performed
+    pub drain_operations_total: Arc<std::sync::atomic::AtomicUsize>,
+    /// Metrics: total drain operations skipped (threshold exceeded)
+    pub drain_skipped_total: Arc<std::sync::atomic::AtomicUsize>,
+    /// Metrics: total entries drained successfully
+    pub drain_entries_total: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ClusterManager {
@@ -37,11 +48,15 @@ impl ClusterManager {
             leader_id: Arc::new(RwLock::new(None)),
             peers: Arc::new(RwLock::new(HashMap::new())),
             peer_connections: Arc::new(Mutex::new(HashMap::new())),
+            pending_replication: Arc::new(RwLock::new(HashMap::new())),
             storage,
             sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_applied_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             replication_tx,
             shutdown_tx,
+            drain_operations_total: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drain_skipped_total: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drain_entries_total: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         (manager, replication_rx)
@@ -122,9 +137,30 @@ impl ClusterManager {
             peer.last_heartbeat = Instant::now();
             peer.state = NodeState::Healthy;
             peer.role = role;
-            return was_unhealthy;
+            return was_unhealthy; // Return true if peer just became healthy
         }
         false
+    }
+
+    /// Update peer heartbeat and drain pending queue if peer just became healthy
+    pub async fn update_peer_heartbeat_and_drain(self: &Arc<Self>, peer_id: &str, role: NodeRole) {
+        let peer_addr = {
+            let peers = self.peers.read().await;
+            peers.get(peer_id).map(|p| p.cluster_addr())
+        };
+
+        let just_became_healthy = self.update_peer_heartbeat(peer_id, role).await;
+
+        if just_became_healthy {
+            if let Some(addr) = peer_addr {
+                let manager = Arc::clone(self);
+                let peer_id = peer_id.to_string();
+                // Drain in background to not block heartbeat processing
+                tokio::spawn(async move {
+                    manager.drain_pending_for_peer(&peer_id, &addr).await;
+                });
+            }
+        }
     }
 
     /// Apply a replication entry to local storage using LWW (Last-Write-Wins)
@@ -183,8 +219,10 @@ impl ClusterManager {
                         storage.delete_if_newer(db_id.clone(), &key, incoming_timestamp).await;
                     }
                 }
-                _ => {
-                    info!("Unsupported replication operation: {:?}", operation);
+                ReplicationOp::CRDTMerge { key, counter_state } => {
+                    if let Ok(counter) = serde_json::from_str::<storage::PNCounter>(&counter_state) {
+                        storage.crdt_merge(db_id, &key, &counter).await;
+                    }
                 }
             }
 
@@ -461,22 +499,256 @@ impl ClusterManager {
         let role = self.role.read().await;
         let leader_id = self.leader_id.read().await;
         let peers = self.peers.read().await;
+        let pending = self.pending_replication.read().await;
         let sequence = self.current_sequence();
 
         let peer_list: Vec<String> = peers.values().map(|p| {
-            format!(r#"{{"id":"{}","host":"{}","port":{},"state":"{:?}","role":"{}"}}"#,
-                p.id, p.host, p.port, p.state, p.role)
+            let pending_count = pending.get(&p.id).map(|q| q.len()).unwrap_or(0);
+            format!(r#"{{"id":"{}","host":"{}","port":{},"state":"{:?}","role":"{}","pending":{}}}"#,
+                p.id, p.host, p.port, p.state, p.role, pending_count)
         }).collect();
 
+        let total_pending: usize = pending.values().map(|q| q.len()).sum();
+        let drain_ops = self.drain_operations_total.load(std::sync::atomic::Ordering::Relaxed);
+        let drain_skipped = self.drain_skipped_total.load(std::sync::atomic::Ordering::Relaxed);
+        let drain_entries = self.drain_entries_total.load(std::sync::atomic::Ordering::Relaxed);
+
         format!(
-            r#"{{"node_id":"{}","role":"{}","leader":"{}","sequence":{},"peers":[{}],"peer_count":{}}}"#,
+            r#"{{"node_id":"{}","role":"{}","leader":"{}","sequence":{},"peers":[{}],"peer_count":{},"pending_replication":{},"drain_stats":{{"operations":{},"skipped":{},"entries_drained":{}}}}}"#,
             self.config.node_id,
             role,
             leader_id.as_deref().unwrap_or("unknown"),
             sequence,
             peer_list.join(","),
-            peers.len()
+            peers.len(),
+            total_pending,
+            drain_ops,
+            drain_skipped,
+            drain_entries
         )
+    }
+
+    /// Get drain metrics for Prometheus
+    pub fn drain_metrics(&self) -> (usize, usize, usize) {
+        (
+            self.drain_operations_total.load(std::sync::atomic::Ordering::Relaxed),
+            self.drain_skipped_total.load(std::sync::atomic::Ordering::Relaxed),
+            self.drain_entries_total.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Replicate entry to all peers (multi-master: all nodes replicate)
+    /// Entries for unhealthy peers are queued for later delivery
+    pub async fn replicate_to_all_peers(&self, entry: &ReplicationEntry) -> usize {
+        let (healthy_peers, unhealthy_peers): (Vec<_>, Vec<_>) = {
+            let peers = self.peers.read().await;
+            peers.values()
+                .map(|p| (p.id.clone(), p.cluster_addr(), p.state == NodeState::Healthy))
+                .partition(|(_, _, healthy)| *healthy)
+        };
+
+        // Queue entries for unhealthy peers
+        if !unhealthy_peers.is_empty() {
+            let mut pending = self.pending_replication.write().await;
+            for (peer_id, _, _) in unhealthy_peers {
+                let queue = pending.entry(peer_id.clone()).or_insert_with(VecDeque::new);
+                if queue.len() >= MAX_PENDING_PER_PEER {
+                    queue.pop_front(); // Drop oldest to make room
+                }
+                queue.push_back(entry.clone());
+            }
+        }
+
+        // Send to healthy peers
+        if healthy_peers.is_empty() {
+            return 0;
+        }
+
+        let timeout = self.config.replication_timeout;
+
+        let futures: Vec<_> = healthy_peers
+            .into_iter()
+            .map(|(_, addr, _)| {
+                let entry_clone = entry.clone();
+                async move {
+                    replicate_to_peer(&addr, &entry_clone, timeout).await.is_ok()
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        results.into_iter().filter(|&ok| ok).count()
+    }
+
+    /// Drain pending replication queue for a peer that just became healthy
+    /// Implements: threshold check, rate limiting with batches, and circuit breaker
+    pub async fn drain_pending_for_peer(self: &Arc<Self>, peer_id: &str, peer_addr: &str) {
+        let pending_count = {
+            let pending = self.pending_replication.read().await;
+            pending.get(peer_id).map(|q| q.len()).unwrap_or(0)
+        };
+
+        if pending_count == 0 {
+            return;
+        }
+
+        // 1. THRESHOLD CHECK: If queue is too large, skip drain and let Full Sync handle it
+        if pending_count > self.config.pending_drain_threshold {
+            info!(
+                "Skipping drain for peer {} ({} entries > {} threshold), Full Sync will handle it",
+                peer_id, pending_count, self.config.pending_drain_threshold
+            );
+            self.drain_skipped_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Clear the queue since Full Sync will provide complete state
+            let mut pending = self.pending_replication.write().await;
+            if let Some(queue) = pending.get_mut(peer_id) {
+                queue.clear();
+            }
+            return;
+        }
+
+        // Extract all entries from the queue
+        let entries: Vec<ReplicationEntry> = {
+            let mut pending = self.pending_replication.write().await;
+            if let Some(queue) = pending.get_mut(peer_id) {
+                queue.drain(..).collect()
+            } else {
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            return;
+        }
+
+        info!(
+            "Draining {} pending replication entries for peer {} (batch_size={}, delay={}ms)",
+            entries.len(), peer_id, self.config.pending_drain_batch_size, self.config.pending_drain_batch_delay_ms
+        );
+
+        self.drain_operations_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let timeout = self.config.replication_timeout;
+        let batch_size = self.config.pending_drain_batch_size;
+        let batch_delay = Duration::from_millis(self.config.pending_drain_batch_delay_ms);
+        let max_errors = self.config.pending_drain_max_errors;
+
+        // 2. RATE LIMITED DRAIN: Process in batches with delays
+        let mut consecutive_errors = 0usize;
+        let mut total_drained = 0usize;
+        let mut remaining_entries: Vec<ReplicationEntry> = Vec::new();
+
+        for (batch_idx, batch) in entries.chunks(batch_size).enumerate() {
+            // 3. CIRCUIT BREAKER: Stop if too many consecutive errors
+            if consecutive_errors >= max_errors {
+                info!(
+                    "Circuit breaker triggered for peer {} after {} consecutive errors, aborting drain",
+                    peer_id, consecutive_errors
+                );
+                // Re-queue remaining entries
+                remaining_entries.extend(batch.iter().cloned());
+                continue;
+            }
+
+            let mut batch_errors = 0usize;
+            for entry in batch {
+                if consecutive_errors >= max_errors {
+                    remaining_entries.push(entry.clone());
+                    continue;
+                }
+
+                match replicate_to_peer(peer_addr, entry, timeout).await {
+                    Ok(_) => {
+                        consecutive_errors = 0; // Reset on success
+                        total_drained += 1;
+                    }
+                    Err(_) => {
+                        consecutive_errors += 1;
+                        batch_errors += 1;
+                        remaining_entries.push(entry.clone());
+                    }
+                }
+            }
+
+            // Add delay between batches (except for last batch or if circuit breaker triggered)
+            if batch_idx < entries.len() / batch_size && consecutive_errors < max_errors {
+                tokio::time::sleep(batch_delay).await;
+            }
+        }
+
+        self.drain_entries_total.fetch_add(total_drained, std::sync::atomic::Ordering::Relaxed);
+
+        // Re-queue any entries that failed
+        if !remaining_entries.is_empty() {
+            info!(
+                "Re-queuing {} entries for peer {} that failed during drain",
+                remaining_entries.len(), peer_id
+            );
+            let mut pending = self.pending_replication.write().await;
+            let queue = pending.entry(peer_id.to_string()).or_insert_with(VecDeque::new);
+            // Prepend failed entries to front of queue (they should be processed first)
+            for entry in remaining_entries.into_iter().rev() {
+                queue.push_front(entry);
+            }
+        }
+
+        info!(
+            "Drain complete for peer {}: {} entries drained successfully",
+            peer_id, total_drained
+        );
+    }
+
+    /// Get count of pending entries for a peer
+    pub async fn pending_count_for_peer(&self, peer_id: &str) -> usize {
+        let pending = self.pending_replication.read().await;
+        pending.get(peer_id).map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Get total pending replication count across all peers
+    pub async fn total_pending_count(&self) -> usize {
+        let pending = self.pending_replication.read().await;
+        pending.values().map(|q| q.len()).sum()
+    }
+
+    /// Replicate entry to all peers asynchronously with backpressure
+    pub fn replicate_async(self: &Arc<Self>, entry: ReplicationEntry) -> bool {
+        match self.replication_tx.try_send(entry) {
+            Ok(_) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Start the replication worker that processes entries from the queue
+    pub fn start_replication_worker(
+        manager: Arc<Self>,
+        mut rx: mpsc::Receiver<ReplicationEntry>,
+    ) {
+        use futures::stream::FuturesUnordered;
+        use futures::StreamExt;
+
+        tokio::spawn(async move {
+            const MAX_CONCURRENT: usize = 50;
+
+            let mut in_flight = FuturesUnordered::new();
+
+            loop {
+                tokio::select! {
+                    Some(entry) = rx.recv(), if in_flight.len() < MAX_CONCURRENT => {
+                        let manager_clone = Arc::clone(&manager);
+                        in_flight.push(async move {
+                            let _ = manager_clone.replicate_to_all_peers(&entry).await;
+                        });
+                    }
+                    Some(_) = in_flight.next(), if !in_flight.is_empty() => {
+                        // Replication completed, slot freed for new entry
+                    }
+                    else => break,
+                }
+            }
+
+            while in_flight.next().await.is_some() {}
+        });
     }
 }
 
@@ -508,7 +780,7 @@ async fn handle_cluster_connection(
                     _ => NodeRole::Follower,
                 };
 
-                manager.update_peer_heartbeat(&peer_id, peer_role).await;
+                manager.update_peer_heartbeat_and_drain(&peer_id, peer_role).await;
 
                 let our_role = manager.role().await;
                 let ack_msg = format!("{}:{}", manager.node_id(), our_role);
@@ -618,7 +890,7 @@ async fn handle_cluster_connection(
                     manager.set_role(NodeRole::Follower).await;
                 }
 
-                manager.update_peer_heartbeat(&new_leader_id, NodeRole::Leader).await;
+                manager.update_peer_heartbeat_and_drain(&new_leader_id, NodeRole::Leader).await;
             }
             _ => {
                 info!("Unknown cluster operation: {}", op);
@@ -963,9 +1235,14 @@ pub fn serialize_replication_entry(entry: &ReplicationEntry) -> Vec<u8> {
             data.extend_from_slice(&(keys_bytes.len() as u32).to_be_bytes());
             data.extend_from_slice(keys_bytes);
         }
-        _ => {
-            // CRDTMerge not yet supported in serialization
-            data.push(0);
+        ReplicationOp::CRDTMerge { key, counter_state } => {
+            data.push(15);
+            let key_bytes = key.as_bytes();
+            let state_bytes = counter_state.as_bytes();
+            data.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
+            data.extend_from_slice(key_bytes);
+            data.extend_from_slice(&(state_bytes.len() as u32).to_be_bytes());
+            data.extend_from_slice(state_bytes);
         }
     }
 
@@ -1129,6 +1406,16 @@ pub fn deserialize_replication_entry(data: &[u8]) -> Option<ReplicationEntry> {
             let keys_str = String::from_utf8_lossy(data.get(offset..offset+keys_len)?).to_string();
             let keys: Vec<String> = keys_str.split('\n').map(|s| s.to_string()).collect();
             ReplicationOp::MDel { keys }
+        }
+        15 => {
+            let key_len = u32::from_be_bytes(data.get(offset..offset+4)?.try_into().ok()?) as usize;
+            offset += 4;
+            let key = String::from_utf8_lossy(data.get(offset..offset+key_len)?).to_string();
+            offset += key_len;
+            let state_len = u32::from_be_bytes(data.get(offset..offset+4)?.try_into().ok()?) as usize;
+            offset += 4;
+            let counter_state = String::from_utf8_lossy(data.get(offset..offset+state_len)?).to_string();
+            ReplicationOp::CRDTMerge { key, counter_state }
         }
         _ => return None,
     };
