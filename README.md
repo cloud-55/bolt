@@ -1,22 +1,39 @@
 # Bolt
 
-A high-performance, in-memory key-value database written in Rust.
+High-performance, in-memory key-value database with multi-master replication.
 
 ## Features
 
-- **Data Types**: Strings, Counters, Lists, Sets
+- **Storage**: Strings, Counters, Lists, Sets with LZ4 compression
 - **Persistence**: Write-Ahead Log (WAL) with CRC32 checksums
-- **Performance**: Async I/O, LZ4 compression for large values
-- **Operations**: GET/PUT/DEL, MGET/MSET, INCR/DECR, LPUSH/RPUSH, SADD/SREM
+- **Clustering**: Multi-master replication with LWW conflict resolution
+- **CRDT**: Distributed counters that converge across nodes
 - **TTL**: Key expiration with lazy + active cleanup
-- **CLI**: Interactive client (boltctl)
+- **Performance**: Async I/O with Tokio
 
 ## Quick Start
 
 ```bash
-cargo run --bin bolt     # Start server
-cargo run --bin boltctl  # Start CLI
+cargo run --bin bolt
 ```
+
+## Clustering
+
+Bolt supports multi-master replication:
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐
+│  Node 1  │◄───►│  Node 2  │◄───►│  Node 3  │
+│ (master) │     │ (master) │     │ (master) │
+└──────────┘     └──────────┘     └──────────┘
+```
+
+- All nodes accept reads and writes
+- Async replication to peers
+- LWW conflict resolution
+- CRDT counters for distributed counting
+- Pending queue with drain for offline peers
+- Full sync for large divergence
 
 ## Data Types
 
@@ -26,20 +43,7 @@ cargo run --bin boltctl  # Start CLI
 | Counter | INCR, DECR |
 | List | LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN |
 | Set | SADD, SREM, SMEMBERS, SISMEMBER, SCARD |
-
-## Architecture
-
-```
-Client → TCP → Server → Storage Engine
-                            │
-                  ┌─────────┼──────────┐
-                  │         │          │
-               Strings  Counters    Lists/Sets
-                  │
-              Compression (LZ4)
-                  │
-                 WAL
-```
+| CRDT Counter | CINCR, CDECR, CGET |
 
 ## License
 
