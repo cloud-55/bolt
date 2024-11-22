@@ -8,7 +8,11 @@ members = [
     "src/logger",
     "src/cluster",
 ]
+default-members = ["src/bolt", "src/ctl"]
 resolver = "2"
+
+[profile.dev]
+panic = "abort"
 
 [profile.release]
 panic = "abort"
