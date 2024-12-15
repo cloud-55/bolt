@@ -1,23 +1,29 @@
 use storage::{Storage, StorageConfig, DatabaseId};
 use std::env;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use log::info;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::io::{AsyncRead, AsyncWrite};
+use crate::auth::{UserStore, Session, UserRole, AuthError};
 use crate::error::ServerError;
 use crate::message::Message;
+use crate::metrics::Metrics;
 use crate::opcodes::*;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: &str = "2012";
 const DEFAULT_DATA_DIR: &str = "./data";
+const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 
 pub struct Server {
     storage: Storage,
     host: String,
     port: u16,
+    user_store: UserStore,
+    max_connections: usize,
 }
 
 impl Server {
@@ -42,10 +48,56 @@ impl Server {
             Storage::with_config(StorageConfig::in_memory())?
         };
 
+        // User authentication configuration
+        let users_file = format!("{}/users.json", data_dir);
+        let user_store = if persistence_enabled {
+            UserStore::with_persistence(&users_file)?
+        } else {
+            UserStore::new()
+        };
+
+        // Create default admin user if no users exist
+        let default_admin_password = env::var("BOLT_ADMIN_PASSWORD")
+            .unwrap_or_else(|_| "admin".to_string());
+        let is_default_password = default_admin_password == "admin";
+
+        // We need to run this in a blocking context since we're in a sync function
+        let user_store_clone = user_store.clone();
+        let created_admin = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                user_store_clone.ensure_default_admin(&default_admin_password).await
+            })
+        }).join().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to create admin user"))??;
+
+        if created_admin {
+            info!("Created default admin user (username: admin, password: {})",
+                  if is_default_password { "admin - CHANGE THIS!" } else { "****" });
+        }
+
+        let user_count = std::thread::spawn({
+            let user_store = user_store.clone();
+            move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async { user_store.user_count().await })
+            }
+        }).join().unwrap_or(0);
+
+        info!("Authentication enabled ({} users configured)", user_count);
+
+        // Connection limits
+        let max_connections = env::var("BOLT_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+        info!("Max connections: {}", max_connections);
+
         Ok(Server {
             storage,
             host,
             port,
+            user_store,
+            max_connections,
         })
     }
 
@@ -66,6 +118,7 @@ impl Server {
 
         // Shutdown broadcast channel
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let metrics = Arc::new(Metrics::new());
 
         // Spawn signal handler
         let shutdown_tx_clone = shutdown_tx.clone();
@@ -85,18 +138,32 @@ impl Server {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
-                            let storage = self.storage.clone();
-                            let mut client_shutdown_rx = shutdown_tx.subscribe();
+                            // Check connection limit
+                            let current = metrics.active_connections.load(Ordering::SeqCst);
+                            if current >= self.max_connections {
+                                info!("Connection limit reached ({}), rejecting connection from {}", self.max_connections, peer_addr);
+                                drop(stream);
+                                continue;
+                            }
 
-                            info!("New connection from {}", peer_addr);
+                            let storage = self.storage.clone();
+                            let metrics = metrics.clone();
+                            let mut client_shutdown_rx = shutdown_tx.subscribe();
+                            let user_store = self.user_store.clone();
+                            let max_connections = self.max_connections;
+
+                            metrics.active_connections.fetch_add(1, Ordering::SeqCst);
+                            metrics.total_connections.fetch_add(1, Ordering::SeqCst);
+                            info!("New connection from {} (active: {}/{})", peer_addr, metrics.active_connections.load(Ordering::SeqCst), max_connections);
 
                             tokio::spawn(async move {
-                                let result = handle_client(stream, storage, &mut client_shutdown_rx).await;
+                                let result = handle_client(stream, storage, &mut client_shutdown_rx, user_store, metrics.clone()).await;
 
+                                metrics.active_connections.fetch_sub(1, Ordering::SeqCst);
                                 if let Err(e) = result {
-                                    info!("Connection closed from {}: {}", peer_addr, e);
+                                    info!("Connection closed from {}: {} (active: {})", peer_addr, e, metrics.active_connections.load(Ordering::SeqCst));
                                 } else {
-                                    info!("Connection closed from {}", peer_addr);
+                                    info!("Connection closed from {} (active: {})", peer_addr, metrics.active_connections.load(Ordering::SeqCst));
                                 }
                             });
                         }
@@ -106,7 +173,24 @@ impl Server {
                     }
                 }
                 _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received, stopping server...");
+                    info!("Shutdown signal received, waiting for {} active connections to close...",
+                          metrics.active_connections.load(Ordering::SeqCst));
+
+                    // Wait for active connections with timeout
+                    let timeout = tokio::time::Duration::from_secs(10);
+                    let start = tokio::time::Instant::now();
+
+                    while metrics.active_connections.load(Ordering::SeqCst) > 0 && start.elapsed() < timeout {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+
+                    let remaining = metrics.active_connections.load(Ordering::SeqCst);
+                    if remaining > 0 {
+                        info!("Timeout waiting for {} connections, forcing shutdown", remaining);
+                    } else {
+                        info!("All connections closed gracefully");
+                    }
+
                     info!("BOLT server stopped");
                     return Ok(());
                 }
@@ -119,16 +203,39 @@ async fn handle_client<S>(
     mut stream: S,
     storage: Storage,
     shutdown_rx: &mut broadcast::Receiver<()>,
+    user_store: UserStore,
+    metrics: Arc<Metrics>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let mut session = Session::new();
+
+    // Authenticate the client first
+    match authenticate_client(&mut stream, &user_store, shutdown_rx).await {
+        Ok(Some(user)) => {
+            session.authenticate(user);
+            info!("Client authenticated as '{}'", session.username().unwrap_or("unknown"));
+        }
+        Ok(None) => {
+            info!("Authentication failed, closing connection");
+            return Ok(());
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(());
+            }
+            return Err(e);
+        }
+    }
+
+    // Process messages
     loop {
         tokio::select! {
             result = Message::receive_async(&mut stream) => {
                 match result {
                     Ok(message) => {
-                        if let Err(e) = process_message(&message, &storage, &mut stream).await {
+                        if let Err(e) = process_message(&message, &storage, &mut stream, &metrics, &session, &user_store).await {
                             return Err(e);
                         }
                     }
@@ -148,19 +255,132 @@ where
     }
 }
 
+async fn authenticate_client<S>(
+    stream: &mut S,
+    user_store: &UserStore,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> std::io::Result<Option<crate::auth::User>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    tokio::select! {
+        result = Message::receive_async(stream) => {
+            match result {
+                Ok(message) => {
+                    if message.code != OP_AUTH {
+                        // Client didn't send auth message first
+                        let response = Message {
+                            code: OP_AUTH_FAIL,
+                            key: String::new(),
+                            value: "Authentication required. Send AUTH with username:password".to_string(),
+                            not_found: false,
+                            database_id: DatabaseId::Default,
+                        };
+                        response.send_async(stream).await?;
+                        return Ok(None);
+                    }
+
+                    // Parse username:password from the value field
+                    // Format: "username:password" in value field
+                    let credentials = &message.value;
+                    let (username, password) = if let Some(colon_pos) = credentials.find(':') {
+                        let user = &credentials[..colon_pos];
+                        let pass = &credentials[colon_pos + 1..];
+                        (user, pass)
+                    } else {
+                        // Also support username in key field and password in value field
+                        (message.key.as_str(), credentials.as_str())
+                    };
+
+                    // Authenticate with user store
+                    match user_store.authenticate(username, password).await {
+                        Ok(user) => {
+                            let response = Message {
+                                code: OP_AUTH_OK,
+                                key: user.username.clone(),
+                                value: format!("Authenticated as {} (role: {})", user.username, user.role.as_str()),
+                                not_found: false,
+                                database_id: DatabaseId::Default,
+                            };
+                            response.send_async(stream).await?;
+                            Ok(Some(user))
+                        }
+                        Err(AuthError::InvalidCredentials) => {
+                            let response = Message {
+                                code: OP_AUTH_FAIL,
+                                key: String::new(),
+                                value: "Invalid username or password".to_string(),
+                                not_found: false,
+                                database_id: DatabaseId::Default,
+                            };
+                            response.send_async(stream).await?;
+                            Ok(None)
+                        }
+                        Err(e) => {
+                            let response = Message {
+                                code: OP_AUTH_FAIL,
+                                key: String::new(),
+                                value: format!("Authentication error: {}", e),
+                                not_found: false,
+                                database_id: DatabaseId::Default,
+                            };
+                            response.send_async(stream).await?;
+                            Ok(None)
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        return Ok(None);
+                    }
+                    Err(e)
+                }
+            }
+        }
+        _ = shutdown_rx.recv() => {
+            Ok(None)
+        }
+    }
+}
+
 async fn process_message<S>(
     message: &Message,
     storage: &Storage,
     stream: &mut S,
+    metrics: &Metrics,
+    session: &Session,
+    user_store: &UserStore,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Check write permissions for write operations
+    let requires_write = matches!(
+        message.code,
+        OP_PUT | OP_DEL | OP_SETEX | OP_MSET | OP_MDEL |
+        OP_INCR | OP_DECR | OP_INCRBY |
+        OP_LPUSH | OP_RPUSH | OP_LPOP | OP_RPOP |
+        OP_SADD | OP_SREM
+    );
+
+    if requires_write && !session.can_write() {
+        let response = Message {
+            code: OP_AUTH_FAIL,
+            key: String::new(),
+            value: "Permission denied: write access required".to_string(),
+            not_found: false,
+            database_id: DatabaseId::Default,
+        };
+        response.send_async(stream).await?;
+        return Ok(());
+    }
     match message.code {
         OP_DB_SWITCH => {
             info!("Switched to database: {:?}", message.database_id);
         }
         OP_PUT => {
+            metrics.total_puts.fetch_add(1, Ordering::SeqCst);
+            metrics.total_keys_written.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let value = &message.value;
             storage.set(message.database_id.clone(), key, value).await;
@@ -179,6 +399,8 @@ where
         }
         OP_SETEX => {
             // SET with TTL: key contains the key, value contains "ttl_seconds:actual_value"
+            metrics.total_puts.fetch_add(1, Ordering::SeqCst);
+            metrics.total_keys_written.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
 
             // Parse TTL from value (format: "ttl_seconds:value")
@@ -258,6 +480,8 @@ where
             }
         }
         OP_GET => {
+            metrics.total_gets.fetch_add(1, Ordering::SeqCst);
+            metrics.total_keys_read.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let value = storage.get(database_id.clone(), key).await;
@@ -282,7 +506,9 @@ where
         }
         OP_MGET => {
             // Batch GET: keys are separated by newlines in the key field
+            metrics.total_mgets.fetch_add(1, Ordering::SeqCst);
             let keys: Vec<String> = message.key.split('\n').map(|s| s.to_string()).collect();
+            metrics.total_keys_read.fetch_add(keys.len(), Ordering::SeqCst);
             let database_id = message.database_id.clone();
             let values = storage.mget(database_id.clone(), &keys).await;
 
@@ -304,6 +530,7 @@ where
         }
         OP_MSET => {
             // Batch SET: key field contains "key1\nkey2\n...", value field contains "val1\nval2\n..."
+            metrics.total_msets.fetch_add(1, Ordering::SeqCst);
             let keys: Vec<&str> = message.key.split('\n').collect();
             let values: Vec<&str> = message.value.split('\n').collect();
             let database_id = message.database_id.clone();
@@ -314,6 +541,7 @@ where
                 .collect();
 
             storage.mset(database_id.clone(), &pairs).await;
+            metrics.total_keys_written.fetch_add(pairs.len(), Ordering::SeqCst);
 
             info!("OK MSET {} pairs", pairs.len());
 
@@ -328,9 +556,11 @@ where
         }
         OP_MDEL => {
             // Batch DELETE: keys are separated by newlines in the key field
+            metrics.total_mdels.fetch_add(1, Ordering::SeqCst);
             let keys: Vec<String> = message.key.split('\n').map(|s| s.to_string()).collect();
             let database_id = message.database_id.clone();
             let deleted = storage.mdel(database_id.clone(), &keys).await;
+            metrics.total_keys_deleted.fetch_add(deleted, Ordering::SeqCst);
 
             info!("OK MDEL {} keys (deleted {})", keys.len(), deleted);
             let response = Message {
@@ -343,9 +573,13 @@ where
             response.send_async(stream).await?;
         }
         OP_DEL => {
+            metrics.total_deletes.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let value = storage.remove(database_id.clone(), key).await;
+            if value.is_some() {
+                metrics.total_keys_deleted.fetch_add(1, Ordering::SeqCst);
+            }
 
             let response = match value {
                 Some(value) => {
@@ -366,11 +600,7 @@ where
             response.send_async(stream).await?;
         }
         OP_STATS => {
-            let uptime_secs = 0u64; // Basic stats without metrics struct
-            let stats_json = format!(
-                r#"{{"uptime_seconds":{}}}"#,
-                uptime_secs,
-            );
+            let stats_json = metrics.to_json(storage);
             info!("STATS requested");
             let response = Message {
                 code: OP_STATS,
@@ -383,6 +613,7 @@ where
         }
         // Counter operations
         OP_INCR => {
+            metrics.total_incrs.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let new_value = storage.incr(database_id.clone(), key).await;
@@ -398,6 +629,7 @@ where
             response.send_async(stream).await?;
         }
         OP_DECR => {
+            metrics.total_incrs.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let new_value = storage.decr(database_id.clone(), key).await;
@@ -413,6 +645,7 @@ where
             response.send_async(stream).await?;
         }
         OP_INCRBY => {
+            metrics.total_incrs.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let delta: i64 = message.value.parse().unwrap_or(0);
@@ -430,6 +663,7 @@ where
         }
         // List operations
         OP_LPUSH => {
+            metrics.total_list_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let values: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
@@ -446,6 +680,7 @@ where
             response.send_async(stream).await?;
         }
         OP_RPUSH => {
+            metrics.total_list_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let values: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
@@ -462,6 +697,7 @@ where
             response.send_async(stream).await?;
         }
         OP_LPOP => {
+            metrics.total_list_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let value = storage.lpop(database_id.clone(), key).await;
@@ -485,6 +721,7 @@ where
             response.send_async(stream).await?;
         }
         OP_RPOP => {
+            metrics.total_list_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let value = storage.rpop(database_id.clone(), key).await;
@@ -508,6 +745,7 @@ where
             response.send_async(stream).await?;
         }
         OP_LRANGE => {
+            metrics.total_list_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             // Parse start:stop from value
@@ -527,6 +765,7 @@ where
             response.send_async(stream).await?;
         }
         OP_LLEN => {
+            metrics.total_list_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let len = storage.llen(database_id.clone(), key).await;
@@ -542,6 +781,7 @@ where
         }
         // Set operations
         OP_SADD => {
+            metrics.total_set_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let members: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
@@ -558,6 +798,7 @@ where
             response.send_async(stream).await?;
         }
         OP_SREM => {
+            metrics.total_set_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let members: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
@@ -574,6 +815,7 @@ where
             response.send_async(stream).await?;
         }
         OP_SMEMBERS => {
+            metrics.total_set_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let members = storage.smembers(database_id.clone(), key).await;
@@ -589,6 +831,7 @@ where
             response.send_async(stream).await?;
         }
         OP_SCARD => {
+            metrics.total_set_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let database_id = message.database_id.clone();
             let size = storage.scard(database_id.clone(), key).await;
@@ -603,6 +846,7 @@ where
             response.send_async(stream).await?;
         }
         OP_SISMEMBER => {
+            metrics.total_set_ops.fetch_add(1, Ordering::SeqCst);
             let key = &message.key;
             let member = &message.value;
             let database_id = message.database_id.clone();
@@ -672,6 +916,259 @@ where
                 value: result,
                 not_found: false,
                 database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        // User management operations
+        OP_USER_ADD => {
+            if !session.can_manage_users() {
+                let response = Message {
+                    code: OP_AUTH_FAIL,
+                    key: String::new(),
+                    value: "Permission denied: admin access required".to_string(),
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                return Ok(());
+            }
+
+            // Format: key=username, value=password:role
+            let username = &message.key;
+            let parts: Vec<&str> = message.value.splitn(2, ':').collect();
+            let (password, role_str) = if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                (message.value.as_str(), "readwrite")
+            };
+
+            let role = UserRole::from_str(role_str).unwrap_or(UserRole::ReadWrite);
+
+            match user_store.add_user(username, password, role.clone()).await {
+                Ok(()) => {
+                    info!("User '{}' created with role '{}'", username, role.as_str());
+                    let response = Message {
+                        code: OP_USER_ADD,
+                        key: username.clone(),
+                        value: format!("User '{}' created with role '{}'", username, role.as_str()),
+                        not_found: false,
+                        database_id: DatabaseId::Default,
+                    };
+                    response.send_async(stream).await?;
+                }
+                Err(e) => {
+                    let response = Message {
+                        code: OP_AUTH_FAIL,
+                        key: String::new(),
+                        value: format!("Failed to create user: {}", e),
+                        not_found: false,
+                        database_id: DatabaseId::Default,
+                    };
+                    response.send_async(stream).await?;
+                }
+            }
+        }
+        OP_USER_DEL => {
+            if !session.can_manage_users() {
+                let response = Message {
+                    code: OP_AUTH_FAIL,
+                    key: String::new(),
+                    value: "Permission denied: admin access required".to_string(),
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                return Ok(());
+            }
+
+            let username = &message.key;
+
+            // Prevent deleting yourself
+            if session.username() == Some(username) {
+                let response = Message {
+                    code: OP_AUTH_FAIL,
+                    key: String::new(),
+                    value: "Cannot delete your own user".to_string(),
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                return Ok(());
+            }
+
+            match user_store.remove_user(username).await {
+                Ok(()) => {
+                    info!("User '{}' deleted", username);
+                    let response = Message {
+                        code: OP_USER_DEL,
+                        key: username.clone(),
+                        value: format!("User '{}' deleted", username),
+                        not_found: false,
+                        database_id: DatabaseId::Default,
+                    };
+                    response.send_async(stream).await?;
+                }
+                Err(e) => {
+                    let response = Message {
+                        code: OP_AUTH_FAIL,
+                        key: String::new(),
+                        value: format!("Failed to delete user: {}", e),
+                        not_found: false,
+                        database_id: DatabaseId::Default,
+                    };
+                    response.send_async(stream).await?;
+                }
+            }
+        }
+        OP_USER_LIST => {
+            if !session.can_manage_users() {
+                let response = Message {
+                    code: OP_AUTH_FAIL,
+                    key: String::new(),
+                    value: "Permission denied: admin access required".to_string(),
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                return Ok(());
+            }
+
+            let users = user_store.list_users().await;
+            let result: Vec<String> = users.iter()
+                .map(|(name, role)| format!("{}:{}", name, role.as_str()))
+                .collect();
+            let response = Message {
+                code: OP_USER_LIST,
+                key: String::new(),
+                value: result.join("\n"),
+                not_found: false,
+                database_id: DatabaseId::Default,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_USER_PASSWD => {
+            // Users can change their own password, admins can change anyone's
+            let username = &message.key;
+            let new_password = &message.value;
+
+            let is_self = session.username() == Some(username);
+            let is_admin = session.can_manage_users();
+
+            if !is_self && !is_admin {
+                let response = Message {
+                    code: OP_AUTH_FAIL,
+                    key: String::new(),
+                    value: "Permission denied: can only change your own password".to_string(),
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                return Ok(());
+            }
+
+            match user_store.change_password(username, new_password).await {
+                Ok(()) => {
+                    info!("Password changed for user '{}'", username);
+                    let response = Message {
+                        code: OP_USER_PASSWD,
+                        key: username.clone(),
+                        value: "Password changed successfully".to_string(),
+                        not_found: false,
+                        database_id: DatabaseId::Default,
+                    };
+                    response.send_async(stream).await?;
+                }
+                Err(e) => {
+                    let response = Message {
+                        code: OP_AUTH_FAIL,
+                        key: String::new(),
+                        value: format!("Failed to change password: {}", e),
+                        not_found: false,
+                        database_id: DatabaseId::Default,
+                    };
+                    response.send_async(stream).await?;
+                }
+            }
+        }
+        OP_USER_ROLE => {
+            if !session.can_manage_users() {
+                let response = Message {
+                    code: OP_AUTH_FAIL,
+                    key: String::new(),
+                    value: "Permission denied: admin access required".to_string(),
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                return Ok(());
+            }
+
+            let username = &message.key;
+            let role_str = &message.value;
+
+            // Prevent changing your own role (to avoid locking yourself out)
+            if session.username() == Some(username) {
+                let response = Message {
+                    code: OP_AUTH_FAIL,
+                    key: String::new(),
+                    value: "Cannot change your own role".to_string(),
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                return Ok(());
+            }
+
+            let role = match UserRole::from_str(role_str) {
+                Some(r) => r,
+                None => {
+                    let response = Message {
+                        code: OP_AUTH_FAIL,
+                        key: String::new(),
+                        value: "Invalid role. Use: admin, readwrite, or readonly".to_string(),
+                        not_found: false,
+                        database_id: DatabaseId::Default,
+                    };
+                    response.send_async(stream).await?;
+                    return Ok(());
+                }
+            };
+
+            match user_store.change_role(username, role.clone()).await {
+                Ok(()) => {
+                    info!("Role changed for user '{}' to '{}'", username, role.as_str());
+                    let response = Message {
+                        code: OP_USER_ROLE,
+                        key: username.clone(),
+                        value: format!("Role changed to '{}'", role.as_str()),
+                        not_found: false,
+                        database_id: DatabaseId::Default,
+                    };
+                    response.send_async(stream).await?;
+                }
+                Err(e) => {
+                    let response = Message {
+                        code: OP_AUTH_FAIL,
+                        key: String::new(),
+                        value: format!("Failed to change role: {}", e),
+                        not_found: false,
+                        database_id: DatabaseId::Default,
+                    };
+                    response.send_async(stream).await?;
+                }
+            }
+        }
+        OP_WHOAMI => {
+            let (username, role) = match &session.user {
+                Some(user) => (user.username.clone(), user.role.as_str().to_string()),
+                None => ("anonymous".to_string(), "none".to_string()),
+            };
+            let response = Message {
+                code: OP_WHOAMI,
+                key: username,
+                value: role,
+                not_found: false,
+                database_id: DatabaseId::Default,
             };
             response.send_async(stream).await?;
         }
