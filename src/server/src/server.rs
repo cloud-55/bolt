@@ -1,4 +1,4 @@
-use storage::{Storage, StorageConfig, DatabaseId};
+use storage::{Storage, StorageConfig, DatabaseId, EvictionPolicy, format_bytes};
 use std::env;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -12,11 +12,13 @@ use crate::error::ServerError;
 use crate::message::Message;
 use crate::metrics::Metrics;
 use crate::opcodes::*;
+use crate::http_metrics::HttpMetricsServer;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: &str = "2012";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_MAX_CONNECTIONS: usize = 1000;
+const DEFAULT_METRICS_PORT: &str = "9091";
 
 pub struct Server {
     storage: Storage,
@@ -39,14 +41,86 @@ impl Server {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(true);
 
+        // High-performance mode: sharded storage with batched WAL
+        let high_performance = env::var("BOLT_HIGH_PERF")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let shard_count = env::var("BOLT_SHARD_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64usize);
+
+        let wal_batch_size = env::var("BOLT_WAL_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000usize);
+
+        let wal_flush_interval_ms = env::var("BOLT_WAL_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10u64);
+
+        // Memory management configuration
+        let max_memory = storage::memory::parse_memory_size(
+            &env::var("BOLT_MAX_MEMORY").unwrap_or_default()
+        ).unwrap_or_else(|_| storage::memory::default_max_memory());
+
+        let eviction_policy = env::var("BOLT_EVICTION_POLICY")
+            .ok()
+            .and_then(|s| EvictionPolicy::from_str(&s))
+            .unwrap_or(EvictionPolicy::AllKeysLRU);
+
+        let memory_warning_threshold = env::var("BOLT_MEMORY_WARNING_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90usize);
+
         let storage = if persistence_enabled {
             let wal_path = format!("{}/bolt.wal", data_dir);
             info!("Persistence enabled, WAL path: {}", wal_path);
-            Storage::with_config(StorageConfig::with_wal(&wal_path))?
+
+            let mut config = StorageConfig::with_wal(&wal_path)
+                .with_max_memory(max_memory)
+                .with_eviction_policy(eviction_policy)
+                .with_memory_warning_threshold(memory_warning_threshold);
+
+            if high_performance {
+                config = config
+                    .with_high_performance()
+                    .with_shard_count(shard_count)
+                    .with_wal_batch_size(wal_batch_size)
+                    .with_wal_flush_interval_ms(wal_flush_interval_ms);
+                info!("High-performance mode enabled (shards: {}, batch_size: {}, flush_interval: {}ms)",
+                      shard_count, wal_batch_size, wal_flush_interval_ms);
+            }
+
+            Storage::with_config(config)?
         } else {
             info!("Running in memory-only mode (no persistence)");
-            Storage::with_config(StorageConfig::in_memory())?
+            let config = StorageConfig::in_memory()
+                .with_max_memory(max_memory)
+                .with_eviction_policy(eviction_policy)
+                .with_memory_warning_threshold(memory_warning_threshold);
+
+            if high_performance {
+                info!("High-performance mode enabled (shards: {})", shard_count);
+                let config = config
+                    .with_high_performance()
+                    .with_shard_count(shard_count);
+                Storage::with_config(config)?
+            } else {
+                Storage::with_config(config)?
+            }
         };
+
+        // Log memory configuration
+        if max_memory > 0 {
+            info!("Memory limit: {} (eviction: {}, warning at {}%)",
+                  format_bytes(max_memory), eviction_policy, memory_warning_threshold);
+        } else {
+            info!("Memory limit: unlimited (no eviction)");
+        }
 
         // User authentication configuration
         let users_file = format!("{}/users.json", data_dir);
@@ -119,6 +193,30 @@ impl Server {
         // Shutdown broadcast channel
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let metrics = Arc::new(Metrics::new());
+
+        // Start HTTP metrics server for Prometheus
+        let metrics_port = env::var("BOLT_METRICS_PORT")
+            .unwrap_or_else(|_| DEFAULT_METRICS_PORT.to_string())
+            .parse::<u16>()
+            .unwrap_or(9091);
+
+        let metrics_enabled = env::var("BOLT_METRICS_ENABLED")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+
+        if metrics_enabled {
+            let http_server = HttpMetricsServer::new(
+                storage_clone.clone(),
+                metrics.clone(),
+                None, // No cluster in this version
+                metrics_port,
+            );
+            tokio::spawn(async move {
+                if let Err(e) = http_server.start().await {
+                    log::error!("HTTP metrics server error: {}", e);
+                }
+            });
+        }
 
         // Spawn signal handler
         let shutdown_tx_clone = shutdown_tx.clone();
@@ -611,6 +709,30 @@ where
             };
             response.send_async(stream).await?;
         }
+        OP_METRICS => {
+            let prometheus_metrics = metrics.to_prometheus(storage, None).await;
+            info!("METRICS (Prometheus) requested");
+            let response = Message {
+                code: OP_METRICS,
+                key: String::new(),
+                value: prometheus_metrics,
+                not_found: false,
+                database_id: DatabaseId::Default,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_CLUSTER_STATUS => {
+            let cluster_json = r#"{"mode":"standalone"}"#.to_string();
+            info!("CLUSTER STATUS requested");
+            let response = Message {
+                code: OP_CLUSTER_STATUS,
+                key: String::new(),
+                value: cluster_json,
+                not_found: false,
+                database_id: DatabaseId::Default,
+            };
+            response.send_async(stream).await?;
+        }
         // Counter operations
         OP_INCR => {
             metrics.total_incrs.fetch_add(1, Ordering::SeqCst);
@@ -654,6 +776,82 @@ where
             info!("OK INCRBY {} {} = {}", key, delta, new_value);
             let response = Message {
                 code: OP_INCRBY,
+                key: key.clone(),
+                value: new_value.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        // CRDT Counter operations
+        OP_CINCR => {
+            metrics.total_incrs.fetch_add(1, Ordering::SeqCst);
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+
+            let node_id = "standalone".to_string();
+            let new_value = storage.crdt_incr(database_id.clone(), key, &node_id).await;
+
+            info!("OK CINCR {} = {}", key, new_value);
+            let response = Message {
+                code: OP_CINCR,
+                key: key.clone(),
+                value: new_value.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_CDECR => {
+            metrics.total_incrs.fetch_add(1, Ordering::SeqCst);
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+
+            let node_id = "standalone".to_string();
+            let new_value = storage.crdt_decr(database_id.clone(), key, &node_id).await;
+
+            info!("OK CDECR {} = {}", key, new_value);
+            let response = Message {
+                code: OP_CDECR,
+                key: key.clone(),
+                value: new_value.to_string(),
+                not_found: false,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_CGET => {
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let value = storage.crdt_get(database_id.clone(), key).await;
+
+            let (value_str, not_found) = match value {
+                Some(v) => (v.to_string(), false),
+                None => (String::new(), true),
+            };
+
+            info!("OK CGET {} = {:?}", key, value);
+            let response = Message {
+                code: OP_CGET,
+                key: key.clone(),
+                value: value_str,
+                not_found,
+                database_id,
+            };
+            response.send_async(stream).await?;
+        }
+        OP_CINCRBY => {
+            metrics.total_incrs.fetch_add(1, Ordering::SeqCst);
+            let key = &message.key;
+            let database_id = message.database_id.clone();
+            let amount: u64 = message.value.parse().unwrap_or(1);
+
+            let node_id = "standalone".to_string();
+            let new_value = storage.crdt_incr_by(database_id.clone(), key, &node_id, amount).await;
+
+            info!("OK CINCRBY {} {} = {}", key, amount, new_value);
+            let response = Message {
+                code: OP_CINCRBY,
                 key: key.clone(),
                 value: new_value.to_string(),
                 not_found: false,
