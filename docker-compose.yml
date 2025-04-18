@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  # Single node setup (default)
+  bolt:
+    build: .
+    image: bolt:latest
+    container_name: bolt
+    ports:
+      - "2012:2012"
+    volumes:
+      - bolt_data:/data
+    environment:
+      - BOLT_HOST=0.0.0.0
+      - BOLT_PORT=2012
+      - BOLT_DATA_DIR=/data
+      - BOLT_PERSIST=true
+      - BOLT_HIGH_PERF=true
+      - BOLT_ADMIN_PASSWORD=admin
+      - RUST_LOG=info
+    restart: unless-stopped
+    profiles:
+      - single
+
+volumes:
+  bolt_data:
