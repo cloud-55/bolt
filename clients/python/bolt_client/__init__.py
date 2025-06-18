@@ -1,0 +1,42 @@
+"""
+Bolt Database Python Client
+
+A Python client library for connecting to Bolt key-value database clusters.
+
+Example usage:
+    from bolt_client import BoltClient
+
+    # Single node connection
+    client = BoltClient(host="127.0.0.1", port=2012, username="admin", password="admin")
+    client.put("key", "value")
+    value = client.get("key")
+
+    # Cluster connection (multi-master)
+    client = BoltClient.cluster(
+        nodes=["127.0.0.1:2012", "127.0.0.1:2022", "127.0.0.1:2032"],
+        username="admin",
+        password="admin"
+    )
+    client.put("key", "value")  # All nodes accept writes
+"""
+
+from .client import BoltClient
+from .exceptions import (
+    BoltError,
+    ConnectionError,
+    AuthenticationError,
+    KeyNotFoundError,
+    PermissionError,
+    ClusterError,
+)
+
+__version__ = "0.1.0"
+__all__ = [
+    "BoltClient",
+    "BoltError",
+    "ConnectionError",
+    "AuthenticationError",
+    "KeyNotFoundError",
+    "PermissionError",
+    "ClusterError",
+]
