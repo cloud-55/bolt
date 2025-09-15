@@ -33,5 +33,3 @@ pub enum ReplicationOp {
         counter_state: String,
     },
 }
-
-

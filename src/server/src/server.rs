@@ -1,4 +1,4 @@
-use storage::{Storage, StorageConfig, DatabaseId, EvictionPolicy, format_bytes};
+use storage::{Storage, StorageConfig, DatabaseId, current_timestamp_ms, EvictionPolicy, format_bytes};
 use std::env;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -7,12 +7,15 @@ use log::info;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::TlsAcceptor;
 use crate::auth::{UserStore, Session, UserRole, AuthError};
 use crate::error::ServerError;
 use crate::message::Message;
 use crate::metrics::Metrics;
 use crate::opcodes::*;
+use crate::tls::TlsConfig;
 use crate::http_metrics::HttpMetricsServer;
+use cluster::{ClusterConfig, ClusterManager, ReplicationEntry, ReplicationOp};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: &str = "2012";
@@ -25,7 +28,9 @@ pub struct Server {
     host: String,
     port: u16,
     user_store: UserStore,
+    tls_acceptor: Option<TlsAcceptor>,
     max_connections: usize,
+    cluster: Option<Arc<ClusterManager>>,
 }
 
 impl Server {
@@ -159,6 +164,14 @@ impl Server {
 
         info!("Authentication enabled ({} users configured)", user_count);
 
+        // TLS configuration
+        let tls_acceptor = if let Some(tls_config) = TlsConfig::from_env() {
+            Some(tls_config.build_acceptor()?)
+        } else {
+            info!("TLS disabled (set BOLT_TLS_CERT and BOLT_TLS_KEY to enable)");
+            None
+        };
+
         // Connection limits
         let max_connections = env::var("BOLT_MAX_CONNECTIONS")
             .ok()
@@ -166,12 +179,27 @@ impl Server {
             .unwrap_or(DEFAULT_MAX_CONNECTIONS);
         info!("Max connections: {}", max_connections);
 
+        // Cluster configuration
+        let cluster = if let Some(cluster_config) = ClusterConfig::from_env() {
+            info!("Cluster mode enabled, node ID: {}", cluster_config.node_id);
+            let (manager, replication_rx) = ClusterManager::new(cluster_config, storage.clone());
+            let manager = Arc::new(manager);
+            // Start the replication worker with bounded concurrency
+            ClusterManager::start_replication_worker(Arc::clone(&manager), replication_rx);
+            Some(manager)
+        } else {
+            info!("Running in standalone mode (set BOLT_NODE_ID to enable clustering)");
+            None
+        };
+
         Ok(Server {
             storage,
             host,
             port,
             user_store,
+            tls_acceptor,
             max_connections,
+            cluster,
         })
     }
 
@@ -179,7 +207,14 @@ impl Server {
         let addr = format!("{}:{}", self.host, self.port);
         let listener = TcpListener::bind(&addr).await?;
 
-        info!("BOLT is running on {} (TCP, standalone) ...", addr);
+        let protocol = if self.tls_acceptor.is_some() { "TLS" } else { "TCP" };
+        let mode = if self.cluster.is_some() { "cluster" } else { "standalone" };
+        info!("BOLT is running on {} ({}, {}) ...", addr, protocol, mode);
+
+        // Start cluster manager if enabled
+        if let Some(ref cluster) = self.cluster {
+            cluster.start().await?;
+        }
 
         // Start TTL cleanup background task
         let storage_clone = Arc::new(self.storage.clone());
@@ -208,7 +243,7 @@ impl Server {
             let http_server = HttpMetricsServer::new(
                 storage_clone.clone(),
                 metrics.clone(),
-                None, // No cluster in this version
+                self.cluster.clone(),
                 metrics_port,
             );
             tokio::spawn(async move {
@@ -248,14 +283,30 @@ impl Server {
                             let metrics = metrics.clone();
                             let mut client_shutdown_rx = shutdown_tx.subscribe();
                             let user_store = self.user_store.clone();
+                            let tls_acceptor = self.tls_acceptor.clone();
                             let max_connections = self.max_connections;
+                            let cluster = self.cluster.clone();
 
                             metrics.active_connections.fetch_add(1, Ordering::SeqCst);
                             metrics.total_connections.fetch_add(1, Ordering::SeqCst);
                             info!("New connection from {} (active: {}/{})", peer_addr, metrics.active_connections.load(Ordering::SeqCst), max_connections);
 
                             tokio::spawn(async move {
-                                let result = handle_client(stream, storage, &mut client_shutdown_rx, user_store, metrics.clone()).await;
+                                let result = if let Some(acceptor) = tls_acceptor {
+                                    // TLS connection
+                                    match acceptor.accept(stream).await {
+                                        Ok(tls_stream) => {
+                                            handle_client(tls_stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster).await
+                                        }
+                                        Err(e) => {
+                                            info!("TLS handshake failed: {}", e);
+                                            Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                                        }
+                                    }
+                                } else {
+                                    // Plain TCP connection
+                                    handle_client(stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster).await
+                                };
 
                                 metrics.active_connections.fetch_sub(1, Ordering::SeqCst);
                                 if let Err(e) = result {
@@ -303,6 +354,7 @@ async fn handle_client<S>(
     shutdown_rx: &mut broadcast::Receiver<()>,
     user_store: UserStore,
     metrics: Arc<Metrics>,
+    cluster: Option<Arc<ClusterManager>>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -333,7 +385,7 @@ where
             result = Message::receive_async(&mut stream) => {
                 match result {
                     Ok(message) => {
-                        if let Err(e) = process_message(&message, &storage, &mut stream, &metrics, &session, &user_store).await {
+                        if let Err(e) = process_message(&message, &storage, &mut stream, &metrics, &cluster, &session, &user_store).await {
                             return Err(e);
                         }
                     }
@@ -446,6 +498,7 @@ async fn process_message<S>(
     storage: &Storage,
     stream: &mut S,
     metrics: &Metrics,
+    cluster: &Option<Arc<ClusterManager>>,
     session: &Session,
     user_store: &UserStore,
 ) -> std::io::Result<()>
@@ -483,6 +536,21 @@ where
             let value = &message.value;
             storage.set(message.database_id.clone(), key, value).await;
 
+            // Multi-master: replicate to all peers asynchronously (fire-and-forget)
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::Set {
+                        key: key.clone(),
+                        value: value.clone(),
+                    },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
+            }
+
             info!("OK PUT {} {}", key, value);
 
             // Send response back to client
@@ -518,6 +586,22 @@ where
             };
 
             storage.set_with_ttl(message.database_id.clone(), key, &actual_value, ttl).await;
+
+            // Multi-master: replicate to all peers (no leader check)
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::SetEx {
+                        key: key.clone(),
+                        value: actual_value.clone(),
+                        ttl_seconds: ttl_secs,
+                    },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
+            }
 
             info!("OK SETEX {} {} (TTL: {}s)", key, actual_value, ttl_secs);
 
@@ -641,6 +725,28 @@ where
             storage.mset(database_id.clone(), &pairs).await;
             metrics.total_keys_written.fetch_add(pairs.len(), Ordering::SeqCst);
 
+            // Multi-master: replicate to all peers in smaller chunks
+            // Large MSET operations are broken into chunks to avoid overwhelming replication
+            if let Some(ref cluster_mgr) = cluster {
+                const REPLICATION_CHUNK_SIZE: usize = 100;
+                let timestamp = current_timestamp_ms();
+                let origin_node = cluster_mgr.node_id().to_string();
+                let db_id = message.database_id.to_wal_string();
+
+                for chunk in pairs.chunks(REPLICATION_CHUNK_SIZE) {
+                    let entry = ReplicationEntry {
+                        sequence: cluster_mgr.next_sequence(),
+                        database_id: db_id.clone(),
+                        operation: ReplicationOp::MSet {
+                            pairs: chunk.to_vec(),
+                        },
+                        timestamp,
+                        origin_node: origin_node.clone(),
+                    };
+                    cluster_mgr.replicate_async(entry);
+                }
+            }
+
             info!("OK MSET {} pairs", pairs.len());
 
             let response = Message {
@@ -660,6 +766,27 @@ where
             let deleted = storage.mdel(database_id.clone(), &keys).await;
             metrics.total_keys_deleted.fetch_add(deleted, Ordering::SeqCst);
 
+            // Multi-master: replicate to all peers in smaller chunks
+            if let Some(ref cluster_mgr) = cluster {
+                const REPLICATION_CHUNK_SIZE: usize = 100;
+                let timestamp = current_timestamp_ms();
+                let origin_node = cluster_mgr.node_id().to_string();
+                let db_id = message.database_id.to_wal_string();
+
+                for chunk in keys.chunks(REPLICATION_CHUNK_SIZE) {
+                    let entry = ReplicationEntry {
+                        sequence: cluster_mgr.next_sequence(),
+                        database_id: db_id.clone(),
+                        operation: ReplicationOp::MDel {
+                            keys: chunk.to_vec(),
+                        },
+                        timestamp,
+                        origin_node: origin_node.clone(),
+                    };
+                    cluster_mgr.replicate_async(entry);
+                }
+            }
+
             info!("OK MDEL {} keys (deleted {})", keys.len(), deleted);
             let response = Message {
                 code: OP_MDEL,
@@ -677,6 +804,20 @@ where
             let value = storage.remove(database_id.clone(), key).await;
             if value.is_some() {
                 metrics.total_keys_deleted.fetch_add(1, Ordering::SeqCst);
+            }
+
+            // Multi-master: replicate to all peers (no leader check)
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::Delete {
+                        key: key.clone(),
+                    },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
             }
 
             let response = match value {
@@ -710,7 +851,7 @@ where
             response.send_async(stream).await?;
         }
         OP_METRICS => {
-            let prometheus_metrics = metrics.to_prometheus(storage, None).await;
+            let prometheus_metrics = metrics.to_prometheus(storage, cluster.as_ref()).await;
             info!("METRICS (Prometheus) requested");
             let response = Message {
                 code: OP_METRICS,
@@ -722,7 +863,11 @@ where
             response.send_async(stream).await?;
         }
         OP_CLUSTER_STATUS => {
-            let cluster_json = r#"{"mode":"standalone"}"#.to_string();
+            let cluster_json = if let Some(ref cluster_mgr) = cluster {
+                cluster_mgr.status_json().await
+            } else {
+                r#"{"mode":"standalone"}"#.to_string()
+            };
             info!("CLUSTER STATUS requested");
             let response = Message {
                 code: OP_CLUSTER_STATUS,
@@ -740,6 +885,20 @@ where
             let database_id = message.database_id.clone();
             let new_value = storage.incr(database_id.clone(), key).await;
 
+            // Multi-master: replicate to all peers (no leader check)
+            // Note: INCR/DECR operations may have consistency issues in multi-master
+            // Consider using CRDT counters for distributed increment/decrement
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::Incr { key: key.clone() },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
+            }
+
             info!("OK INCR {} = {}", key, new_value);
             let response = Message {
                 code: OP_INCR,
@@ -755,6 +914,20 @@ where
             let key = &message.key;
             let database_id = message.database_id.clone();
             let new_value = storage.decr(database_id.clone(), key).await;
+
+            // Multi-master: replicate to all peers (no leader check)
+            // Note: INCR/DECR operations may have consistency issues in multi-master
+            // Consider using CRDT counters for distributed increment/decrement
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::Decr { key: key.clone() },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
+            }
 
             info!("OK DECR {} = {}", key, new_value);
             let response = Message {
@@ -773,6 +946,20 @@ where
             let delta: i64 = message.value.parse().unwrap_or(0);
             let new_value = storage.incr_by(database_id.clone(), key, delta).await;
 
+            // Multi-master: replicate to all peers (no leader check)
+            // Note: INCRBY operations may have consistency issues in multi-master
+            // Consider using CRDT counters for distributed increment/decrement
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::IncrBy { key: key.clone(), delta },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
+            }
+
             info!("OK INCRBY {} {} = {}", key, delta, new_value);
             let response = Message {
                 code: OP_INCRBY,
@@ -789,8 +976,30 @@ where
             let key = &message.key;
             let database_id = message.database_id.clone();
 
-            let node_id = "standalone".to_string();
+            // Get node_id from cluster or use "standalone"
+            let node_id = cluster.as_ref()
+                .map(|c| c.node_id().to_string())
+                .unwrap_or_else(|| "standalone".to_string());
+
             let new_value = storage.crdt_incr(database_id.clone(), key, &node_id).await;
+
+            // Multi-master: replicate CRDT state to all peers
+            if let Some(ref cluster_mgr) = cluster {
+                if let Some(counter) = storage.crdt_get_state(&database_id, key).await {
+                    let counter_state = serde_json::to_string(&counter).unwrap_or_default();
+                    let entry = ReplicationEntry {
+                        sequence: cluster_mgr.next_sequence(),
+                        database_id: message.database_id.to_wal_string(),
+                        operation: ReplicationOp::CRDTMerge {
+                            key: key.clone(),
+                            counter_state,
+                        },
+                        timestamp: current_timestamp_ms(),
+                        origin_node: cluster_mgr.node_id().to_string(),
+                    };
+                    cluster_mgr.replicate_async(entry);
+                }
+            }
 
             info!("OK CINCR {} = {}", key, new_value);
             let response = Message {
@@ -807,8 +1016,30 @@ where
             let key = &message.key;
             let database_id = message.database_id.clone();
 
-            let node_id = "standalone".to_string();
+            // Get node_id from cluster or use "standalone"
+            let node_id = cluster.as_ref()
+                .map(|c| c.node_id().to_string())
+                .unwrap_or_else(|| "standalone".to_string());
+
             let new_value = storage.crdt_decr(database_id.clone(), key, &node_id).await;
+
+            // Multi-master: replicate CRDT state to all peers
+            if let Some(ref cluster_mgr) = cluster {
+                if let Some(counter) = storage.crdt_get_state(&database_id, key).await {
+                    let counter_state = serde_json::to_string(&counter).unwrap_or_default();
+                    let entry = ReplicationEntry {
+                        sequence: cluster_mgr.next_sequence(),
+                        database_id: message.database_id.to_wal_string(),
+                        operation: ReplicationOp::CRDTMerge {
+                            key: key.clone(),
+                            counter_state,
+                        },
+                        timestamp: current_timestamp_ms(),
+                        origin_node: cluster_mgr.node_id().to_string(),
+                    };
+                    cluster_mgr.replicate_async(entry);
+                }
+            }
 
             info!("OK CDECR {} = {}", key, new_value);
             let response = Message {
@@ -846,8 +1077,30 @@ where
             let database_id = message.database_id.clone();
             let amount: u64 = message.value.parse().unwrap_or(1);
 
-            let node_id = "standalone".to_string();
+            // Get node_id from cluster or use "standalone"
+            let node_id = cluster.as_ref()
+                .map(|c| c.node_id().to_string())
+                .unwrap_or_else(|| "standalone".to_string());
+
             let new_value = storage.crdt_incr_by(database_id.clone(), key, &node_id, amount).await;
+
+            // Multi-master: replicate CRDT state to all peers
+            if let Some(ref cluster_mgr) = cluster {
+                if let Some(counter) = storage.crdt_get_state(&database_id, key).await {
+                    let counter_state = serde_json::to_string(&counter).unwrap_or_default();
+                    let entry = ReplicationEntry {
+                        sequence: cluster_mgr.next_sequence(),
+                        database_id: message.database_id.to_wal_string(),
+                        operation: ReplicationOp::CRDTMerge {
+                            key: key.clone(),
+                            counter_state,
+                        },
+                        timestamp: current_timestamp_ms(),
+                        origin_node: cluster_mgr.node_id().to_string(),
+                    };
+                    cluster_mgr.replicate_async(entry);
+                }
+            }
 
             info!("OK CINCRBY {} {} = {}", key, amount, new_value);
             let response = Message {
@@ -867,6 +1120,18 @@ where
             let values: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
             let len = storage.lpush(database_id.clone(), key, &values).await;
 
+            // Multi-master: replicate to all peers (no leader check)
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::LPush { key: key.clone(), values: values.clone() },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
+            }
+
             info!("OK LPUSH {} {} values = {}", key, values.len(), len);
             let response = Message {
                 code: OP_LPUSH,
@@ -884,6 +1149,18 @@ where
             let values: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
             let len = storage.rpush(database_id.clone(), key, &values).await;
 
+            // Multi-master: replicate to all peers (no leader check)
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::RPush { key: key.clone(), values: values.clone() },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
+            }
+
             info!("OK RPUSH {} {} values = {}", key, values.len(), len);
             let response = Message {
                 code: OP_RPUSH,
@@ -899,6 +1176,21 @@ where
             let key = &message.key;
             let database_id = message.database_id.clone();
             let value = storage.lpop(database_id.clone(), key).await;
+
+            // Replicate to cluster peers if leader (only if there was something to pop)
+            // Multi-master: replicate to all peers (no leader check)
+            if value.is_some() {
+                if let Some(ref cluster_mgr) = cluster {
+                    let entry = ReplicationEntry {
+                        sequence: cluster_mgr.next_sequence(),
+                        database_id: message.database_id.to_wal_string(),
+                        operation: ReplicationOp::LPop { key: key.clone() },
+                        timestamp: current_timestamp_ms(),
+                        origin_node: cluster_mgr.node_id().to_string(),
+                    };
+                    cluster_mgr.replicate_async(entry);
+                }
+            }
 
             let response = match value {
                 Some(v) => {
@@ -923,6 +1215,21 @@ where
             let key = &message.key;
             let database_id = message.database_id.clone();
             let value = storage.rpop(database_id.clone(), key).await;
+
+            // Replicate to cluster peers if leader (only if there was something to pop)
+            // Multi-master: replicate to all peers (no leader check)
+            if value.is_some() {
+                if let Some(ref cluster_mgr) = cluster {
+                    let entry = ReplicationEntry {
+                        sequence: cluster_mgr.next_sequence(),
+                        database_id: message.database_id.to_wal_string(),
+                        operation: ReplicationOp::RPop { key: key.clone() },
+                        timestamp: current_timestamp_ms(),
+                        origin_node: cluster_mgr.node_id().to_string(),
+                    };
+                    cluster_mgr.replicate_async(entry);
+                }
+            }
 
             let response = match value {
                 Some(v) => {
@@ -985,6 +1292,18 @@ where
             let members: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
             let added = storage.sadd(database_id.clone(), key, &members).await;
 
+            // Multi-master: replicate to all peers (no leader check)
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::SAdd { key: key.clone(), members: members.clone() },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
+            }
+
             info!("OK SADD {} {} members, {} added", key, members.len(), added);
             let response = Message {
                 code: OP_SADD,
@@ -1001,6 +1320,18 @@ where
             let database_id = message.database_id.clone();
             let members: Vec<String> = message.value.split('\n').map(|s| s.to_string()).collect();
             let removed = storage.srem(database_id.clone(), key, &members).await;
+
+            // Multi-master: replicate to all peers (no leader check)
+            if let Some(ref cluster_mgr) = cluster {
+                let entry = ReplicationEntry {
+                    sequence: cluster_mgr.next_sequence(),
+                    database_id: message.database_id.to_wal_string(),
+                    operation: ReplicationOp::SRem { key: key.clone(), members: members.clone() },
+                    timestamp: current_timestamp_ms(),
+                    origin_node: cluster_mgr.node_id().to_string(),
+                };
+                cluster_mgr.replicate_async(entry);
+            }
 
             info!("OK SREM {} {} members, {} removed", key, members.len(), removed);
             let response = Message {

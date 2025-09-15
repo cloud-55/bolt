@@ -195,6 +195,3 @@ impl StoredValue {
         self.data.type_name()
     }
 }
-
-
-

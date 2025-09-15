@@ -246,4 +246,3 @@ async fn main() {
     println!("# Benchmark Complete");
     println!("######################################");
 }
-

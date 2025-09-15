@@ -42,8 +42,28 @@ impl Storage {
         }
     }
 
+    /// Create a new high-performance in-memory storage (no persistence)
+    pub fn new_high_performance() -> Self {
+        Storage {
+            backend: StorageBackend::HighPerformance {
+                sharded: Arc::new(crate::sharded::ShardedStorage::new()),
+                wal: Arc::new(crate::batched_wal::BatchedWal::disabled()),
+            },
+            operation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            compaction_threshold: 0,
+            memory_tracker: Arc::new(MemoryTracker::unlimited()),
+            lru_tracker: Arc::new(Mutex::new(LRUTracker::new())),
+            eviction_policy: EvictionPolicy::NoEviction,
+            eviction_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
     /// Create storage with configuration
     pub fn with_config(config: StorageConfig) -> std::io::Result<Self> {
+        if config.high_performance {
+            return Self::with_config_high_performance(config);
+        }
+
         let wal = if let Some(ref path) = config.wal_path {
             Wal::new(path)?
         } else {
@@ -83,6 +103,87 @@ impl Storage {
         }
 
         Ok(storage)
+    }
+
+    fn with_config_high_performance(config: StorageConfig) -> std::io::Result<Self> {
+        use crate::batched_wal::{BatchedWal, BatchedWalConfig};
+        use crate::sharded::ShardedStorage;
+
+        let sharded = Arc::new(ShardedStorage::with_shard_count(config.shard_count));
+
+        let wal = if let Some(ref path) = config.wal_path {
+            let temp_wal = Wal::new(path)?;
+            let entries = temp_wal.read_entries()?;
+            let entry_count = entries.len();
+
+            let sharded_clone = sharded.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    for entry in entries {
+                        match entry {
+                            WalEntry::Set { database_id, key, value, ttl_ms } => {
+                                let db_id = DatabaseId::from_wal_string(&database_id);
+                                let stored = if let Some(ttl) = ttl_ms {
+                                    StoredValue::with_ttl(value, Duration::from_millis(ttl))
+                                } else {
+                                    StoredValue::new(value)
+                                };
+                                sharded_clone.import_entry(db_id, key, stored).await;
+                            }
+                            WalEntry::Delete { database_id, key } => {
+                                let db_id = DatabaseId::from_wal_string(&database_id);
+                                sharded_clone.remove_entry(&db_id, &key).await;
+                            }
+                        }
+                    }
+                });
+            }).join().unwrap();
+
+            if entry_count > 0 {
+                info!("Recovered {} WAL entries (high-performance mode)", entry_count);
+            }
+
+            let wal_config = BatchedWalConfig::new(path)
+                .with_batch_size(config.wal_batch_size)
+                .with_flush_interval(Duration::from_millis(config.wal_flush_interval_ms));
+
+            let wal = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async { BatchedWal::new(wal_config).await })
+            }).join().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to create batched WAL"))??;
+
+            Arc::new(wal)
+        } else {
+            Arc::new(BatchedWal::disabled())
+        };
+
+        // Initialize memory tracking
+        let memory_tracker = if config.max_memory > 0 {
+            Arc::new(MemoryTracker::new(config.max_memory)
+                .with_warning_threshold(config.memory_warning_threshold))
+        } else {
+            Arc::new(MemoryTracker::unlimited())
+        };
+
+        info!("Storage initialized in high-performance mode (shards: {}, batch_size: {})",
+              config.shard_count, config.wal_batch_size);
+        info!(
+            "Memory config: max={}, policy={}, warning_threshold={}%",
+            if config.max_memory > 0 { format_bytes(config.max_memory) } else { "unlimited".to_string() },
+            config.eviction_policy,
+            config.memory_warning_threshold
+        );
+
+        Ok(Storage {
+            backend: StorageBackend::HighPerformance { sharded, wal },
+            operation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            compaction_threshold: config.compaction_threshold,
+            memory_tracker,
+            lru_tracker: Arc::new(Mutex::new(LRUTracker::new())),
+            eviction_policy: config.eviction_policy,
+            eviction_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
     }
 
     fn recover_from_wal_sync(&mut self) -> std::io::Result<()> {
@@ -131,6 +232,10 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    pub fn is_high_performance(&self) -> bool {
+        matches!(self.backend, StorageBackend::HighPerformance { .. })
     }
 
     /// Get memory statistics
@@ -220,7 +325,13 @@ impl Storage {
                     }
                 }
             }
-            _ => {}
+            StorageBackend::HighPerformance { sharded, wal } => {
+                if sharded.remove(&db_id, key).await.is_some() {
+                    // Approximate size removal
+                    self.memory_tracker.subtract(100); // Rough estimate
+                    let _ = wal.log_delete(&db_id.to_wal_string(), key).await;
+                }
+            }
         }
 
         // Remove from LRU tracker
@@ -237,7 +348,9 @@ impl Storage {
                     db.keys().next().cloned() // Simple: just get first key
                 })
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => {
+                sharded.get_random_key(db_id).await
+            }
         }
     }
 
@@ -253,7 +366,9 @@ impl Storage {
                         .map(|(k, _)| k.clone())
                 })
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => {
+                sharded.get_nearest_expiry_key(db_id).await
+            }
         }
     }
 
@@ -268,7 +383,10 @@ impl Storage {
                         .collect()
                 })
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => {
+                let entries = sharded.get_all_entries(&db_id).await;
+                if entries.is_empty() { None } else { Some(entries) }
+            }
         }
     }
 
@@ -318,7 +436,14 @@ impl Storage {
                 }
                 self.memory_tracker.add(entry_size);
             }
-            _ => {}
+            StorageBackend::HighPerformance { sharded, wal } => {
+                sharded.set_with_ttl(db_id.clone(), key, value.to_string(), ttl).await;
+                let ttl_ms = ttl.map(|d| d.as_millis() as u64);
+                let _ = wal.log_set(&db_id.to_wal_string(), key, value, ttl_ms).await;
+
+                // Update memory tracker (approximate for high-perf mode)
+                self.memory_tracker.add(entry_size);
+            }
         }
 
         // Update LRU tracker
@@ -337,7 +462,9 @@ impl Storage {
                 let stored = databases.get(db_id)?.get(key)?;
                 if stored.is_expired() { None } else { Some(stored.timestamp) }
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => {
+                sharded.get_timestamp(db_id, key).await
+            }
         }
     }
 
@@ -360,7 +487,11 @@ impl Storage {
                 let db = databases.entry(db_id).or_insert_with(HashMap::new);
                 db.insert(key.to_string(), stored);
             }
-            _ => {}
+            StorageBackend::HighPerformance { sharded, wal } => {
+                sharded.set_if_newer(db_id.clone(), key, value.to_string(), ttl, incoming_timestamp).await;
+                let ttl_ms = ttl.map(|d| d.as_millis() as u64);
+                let _ = wal.log_set(&db_id.to_wal_string(), key, value, ttl_ms).await;
+            }
         }
         self.maybe_compact().await;
         true
@@ -406,7 +537,15 @@ impl Storage {
                 }
                 updated
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, wal } => {
+                let updated = sharded.mset_if_newer(db_id.clone(), pairs, incoming_timestamp).await;
+                if updated > 0 {
+                    for (key, value) in pairs {
+                        let _ = wal.log_set(&db_id.to_wal_string(), key, value, None).await;
+                    }
+                }
+                updated
+            }
         }
     }
 
@@ -417,7 +556,7 @@ impl Storage {
                 let stored = databases.get(&db_id)?.get(key)?;
                 if stored.is_expired() { None } else { stored.value() }
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.get(&db_id, key).await,
         };
 
         // Update LRU tracker on successful get
@@ -436,7 +575,7 @@ impl Storage {
                 let stored = databases.get(&db_id)?.get(key)?;
                 if stored.is_expired() { None } else { Some(stored.ttl_seconds()) }
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.get_ttl(&db_id, key).await,
         }
     }
 
@@ -458,7 +597,15 @@ impl Storage {
                     None
                 }
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, wal } => {
+                let result = sharded.remove(&db_id, key).await;
+                let _ = wal.log_delete(&db_id.to_wal_string(), key).await;
+                if result.is_some() {
+                    // Approximate size removal for high-perf mode
+                    self.memory_tracker.subtract(100);
+                }
+                result
+            }
         };
 
         // Update LRU tracker
@@ -479,7 +626,7 @@ impl Storage {
                     keys.iter().map(|key| db.get(key).and_then(|sv| if sv.is_expired() { None } else { sv.value() })).collect()
                 }).unwrap_or_else(|| vec![None; keys.len()])
             }
-            _ => vec![None; keys.len()],
+            StorageBackend::HighPerformance { sharded, .. } => sharded.mget(&db_id, keys).await,
         }
     }
 
@@ -493,7 +640,10 @@ impl Storage {
                 let db = databases.entry(db_id.clone()).or_insert_with(HashMap::new);
                 for (key, value) in pairs { db.insert(key.clone(), StoredValue::new(value.clone())); }
             }
-            _ => {}
+            StorageBackend::HighPerformance { sharded, wal } => {
+                sharded.mset(db_id.clone(), pairs).await;
+                for (key, value) in pairs { let _ = wal.log_set(&db_id.to_wal_string(), key, value, None).await; }
+            }
         }
         self.maybe_compact().await;
     }
@@ -511,7 +661,11 @@ impl Storage {
                 }
                 deleted
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, wal } => {
+                let deleted = sharded.mdel(&db_id, keys).await;
+                for key in keys { let _ = wal.log_delete(&db_id.to_wal_string(), key).await; }
+                deleted
+            }
         };
         self.maybe_compact().await;
         deleted
@@ -529,7 +683,7 @@ impl Storage {
                 if removed > 0 { info!("Cleaned up {} expired keys", removed); }
                 removed
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.cleanup_expired().await,
         }
     }
 
@@ -539,14 +693,14 @@ impl Storage {
                 let databases = databases.read().await;
                 databases.values().flat_map(|db| db.values()).filter(|v| !v.is_expired()).count()
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.keys_count().await,
         }
     }
 
     pub async fn databases_count(&self) -> usize {
         match &self.backend {
             StorageBackend::Standard { databases, .. } => databases.read().await.len(),
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.databases_count().await,
         }
     }
 
@@ -570,14 +724,17 @@ impl Storage {
                 };
                 if let Ok(mut wal) = wal.lock() { let _ = wal.compact(&snapshot); }
             }
-            _ => {}
+            StorageBackend::HighPerformance { sharded, wal } => {
+                let snapshot = sharded.snapshot().await;
+                let _ = wal.compact(snapshot).await;
+            }
         }
     }
 
     pub async fn is_persistent(&self) -> bool {
         match &self.backend {
             StorageBackend::Standard { wal, .. } => wal.lock().map(|w| w.is_enabled()).unwrap_or(false),
-            _ => false,
+            StorageBackend::HighPerformance { wal, .. } => wal.is_enabled(),
         }
     }
 
@@ -616,7 +773,11 @@ impl Storage {
                 if let Ok(mut wal) = wal.lock() { let _ = wal.log_set(&db_id.to_wal_string(), key, &new_value.to_string(), None); }
                 new_value
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, wal } => {
+                let new_value = sharded.incr_by(db_id.clone(), key, delta).await;
+                let _ = wal.log_set(&db_id.to_wal_string(), key, &new_value.to_string(), None).await;
+                new_value
+            }
         }
     }
 
@@ -650,7 +811,7 @@ impl Storage {
                     value
                 }
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.crdt_incr_by(db_id, key, node_id, amount).await,
         }
     }
 
@@ -680,7 +841,7 @@ impl Storage {
                     value
                 }
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.crdt_decr_by(db_id, key, node_id, amount).await,
         }
     }
 
@@ -691,7 +852,7 @@ impl Storage {
                 let stored = databases.get(&db_id)?.get(key)?;
                 if stored.is_expired() { None } else if let DataType::CRDTCounter(counter) = &stored.data { Some(counter.value()) } else { None }
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.crdt_get(&db_id, key).await,
         }
     }
 
@@ -713,7 +874,7 @@ impl Storage {
                     db.insert(key.to_string(), StoredValue { data: DataType::CRDTCounter(remote_counter.clone()), expires_at: None, timestamp: current_timestamp_ms() });
                 }
             }
-            _ => {}
+            StorageBackend::HighPerformance { sharded, .. } => sharded.crdt_merge(db_id, key, remote_counter).await,
         }
     }
 
@@ -724,7 +885,7 @@ impl Storage {
                 let stored = databases.get(db_id)?.get(key)?;
                 if stored.is_expired() { None } else if let DataType::CRDTCounter(counter) = &stored.data { Some(counter.clone()) } else { None }
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.crdt_get_state(db_id, key).await,
         }
     }
 
@@ -748,7 +909,7 @@ impl Storage {
                     len
                 }
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.lpush(db_id, key, values).await,
         }
     }
 
@@ -771,7 +932,7 @@ impl Storage {
                     len
                 }
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.rpush(db_id, key, values).await,
         }
     }
 
@@ -784,7 +945,7 @@ impl Storage {
                 if stored.is_expired() { db.remove(key); return None; }
                 if let DataType::List(list) = &mut stored.data { list.pop_front() } else { None }
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.lpop(&db_id, key).await,
         }
     }
 
@@ -797,7 +958,7 @@ impl Storage {
                 if stored.is_expired() { db.remove(key); return None; }
                 if let DataType::List(list) = &mut stored.data { list.pop_back() } else { None }
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.rpop(&db_id, key).await,
         }
     }
 
@@ -820,7 +981,7 @@ impl Storage {
                 }
                 Vec::new()
             }
-            _ => Vec::new(),
+            StorageBackend::HighPerformance { sharded, .. } => sharded.lrange(&db_id, key, start, stop).await,
         }
     }
 
@@ -832,7 +993,7 @@ impl Storage {
                     if stored.is_expired() { 0 } else if let DataType::List(list) = &stored.data { list.len() } else { 0 }
                 }).unwrap_or(0)
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.llen(&db_id, key).await,
         }
     }
 
@@ -857,7 +1018,7 @@ impl Storage {
                     count
                 }
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.sadd(db_id, key, members).await,
         }
     }
 
@@ -877,7 +1038,7 @@ impl Storage {
                 }
                 0
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.srem(&db_id, key, members).await,
         }
     }
 
@@ -889,7 +1050,7 @@ impl Storage {
                     if stored.is_expired() { Vec::new() } else if let DataType::Set(set) = &stored.data { set.iter().cloned().collect() } else { Vec::new() }
                 }).unwrap_or_default()
             }
-            _ => Vec::new(),
+            StorageBackend::HighPerformance { sharded, .. } => sharded.smembers(&db_id, key).await,
         }
     }
 
@@ -901,7 +1062,7 @@ impl Storage {
                     if stored.is_expired() { 0 } else if let DataType::Set(set) = &stored.data { set.len() } else { 0 }
                 }).unwrap_or(0)
             }
-            _ => 0,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.scard(&db_id, key).await,
         }
     }
 
@@ -913,7 +1074,7 @@ impl Storage {
                     if stored.is_expired() { false } else if let DataType::Set(set) = &stored.data { set.contains(member) } else { false }
                 }).unwrap_or(false)
             }
-            _ => false,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.sismember(&db_id, key, member).await,
         }
     }
 
@@ -924,7 +1085,7 @@ impl Storage {
                 let databases = databases.read().await;
                 databases.get(&db_id).and_then(|db| db.get(key)).map(|stored| !stored.is_expired()).unwrap_or(false)
             }
-            _ => false,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.exists(&db_id, key).await,
         }
     }
 
@@ -935,7 +1096,7 @@ impl Storage {
                 let stored = databases.get(&db_id)?.get(key)?;
                 if stored.is_expired() { None } else { Some(stored.type_name()) }
             }
-            _ => None,
+            StorageBackend::HighPerformance { sharded, .. } => sharded.key_type(&db_id, key).await,
         }
     }
 
@@ -951,7 +1112,7 @@ impl Storage {
                 }
                 Vec::new()
             }
-            _ => Vec::new(),
+            StorageBackend::HighPerformance { sharded, .. } => sharded.keys(&db_id, pattern).await,
         }
     }
 
