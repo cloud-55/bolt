@@ -287,6 +287,20 @@ curl -X POST http://localhost:8000/tasks -H "Content-Type: application/json" \
 
 ## Installation
 
+### Quick Install (Linux/macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cloud55/bolt/main/install.sh | bash
+```
+
+This installs `bolt` (server) and `boltctl` (CLI) to `/usr/local/bin`.
+
+### Docker
+
+```bash
+docker run -p 2012:2012 cloud55io/bolt
+```
+
 ### From Source
 
 ```bash
@@ -295,8 +309,8 @@ cd bolt
 cargo build --release
 
 # Binaries in target/release/
-# - bolt-server: The database server
-# - bolt-ctl: Command-line client
+# - bolt: The database server
+# - boltctl: Command-line client
 ```
 
 ### Python SDKs
@@ -310,7 +324,6 @@ pip install bolt-agents
 
 # Or from source
 cd clients/python && pip install -e .
-cd clients/bolt-agents && pip install -e .
 ```
 
 ---
