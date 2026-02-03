@@ -34,3 +34,8 @@ class ClusterError(BoltError):
 class ProtocolError(BoltError):
     """Protocol error in communication."""
     pass
+
+
+class UnsupportedOperationError(BoltError):
+    """Operation not supported by server."""
+    pass

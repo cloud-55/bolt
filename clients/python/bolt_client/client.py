@@ -3,7 +3,8 @@
 import json
 import socket
 import struct
-from typing import Any, Dict, List, Optional, Tuple, Union
+import threading
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .exceptions import (
     AuthenticationError,
@@ -12,6 +13,7 @@ from .exceptions import (
     KeyNotFoundError,
     PermissionError,
     ProtocolError,
+    UnsupportedOperationError,
 )
 from .protocol import HEADER_SIZE, Message, OpCode
 
@@ -750,3 +752,289 @@ class BoltClient:
         """Check if response indicates permission error."""
         if response.code == OpCode.AUTH_FAIL:
             raise PermissionError(response.value)
+
+    # ==================== Pub/Sub Operations (Agent Coordination) ====================
+
+    def subscribe(
+        self,
+        task_type: str,
+        agent_id: str,
+        callback: Callable[[Dict[str, Any]], None],
+    ) -> None:
+        """
+        Subscribe to a task type to receive notifications.
+
+        When a task of this type is created, the callback will be called
+        with the task data. This uses a background thread to listen for
+        notifications from the server.
+
+        Args:
+            task_type: Type of tasks to subscribe to (e.g., "research", "summarize")
+            agent_id: Unique identifier for this agent
+            callback: Function called when a task notification is received
+
+        Raises:
+            UnsupportedOperationError: If server doesn't support Pub/Sub
+        """
+        self._ensure_connected()
+
+        # Send subscribe request
+        msg = Message(
+            code=OpCode.SUBSCRIBE,
+            key=task_type,
+            value=agent_id,
+        )
+        response = self._execute(msg)
+
+        if response.not_found:
+            raise UnsupportedOperationError(
+                f"Server does not support SUBSCRIBE or invalid request: {response.value}"
+            )
+
+        # Store callback and agent_id
+        if not hasattr(self, '_notification_callbacks'):
+            self._notification_callbacks: Dict[str, Callable] = {}
+        if not hasattr(self, '_agent_id'):
+            self._agent_id: Optional[str] = None
+
+        self._notification_callbacks[task_type] = callback
+        self._agent_id = agent_id
+
+        # Start notification listener if not already running
+        self._start_notification_listener()
+
+    def unsubscribe(self, task_type: str, agent_id: Optional[str] = None) -> None:
+        """
+        Unsubscribe from a task type.
+
+        Args:
+            task_type: Type of tasks to unsubscribe from
+            agent_id: Agent ID (uses stored ID if not provided)
+        """
+        aid = agent_id or getattr(self, '_agent_id', '')
+        msg = Message(
+            code=OpCode.UNSUBSCRIBE,
+            key=task_type,
+            value=aid or "",
+        )
+        self._execute(msg)
+
+        # Remove callback
+        if hasattr(self, '_notification_callbacks'):
+            self._notification_callbacks.pop(task_type, None)
+
+    def _start_notification_listener(self) -> None:
+        """Start background thread to listen for notifications."""
+        if hasattr(self, '_listener_running') and self._listener_running:
+            return
+
+        self._listener_running = True
+        self._listener_thread = threading.Thread(
+            target=self._notification_listener_loop,
+            daemon=True,
+        )
+        self._listener_thread.start()
+
+    def _notification_listener_loop(self) -> None:
+        """Background loop that listens for NOTIFY messages."""
+        while self._listener_running and self._connection and self._connection.is_connected():
+            try:
+                # Set a short timeout for non-blocking checks
+                if self._connection._socket:
+                    self._connection._socket.settimeout(1.0)
+
+                # Try to receive a message
+                response = self._connection.receive()
+
+                # Restore original timeout
+                if self._connection._socket:
+                    self._connection._socket.settimeout(self._timeout)
+
+                # Check if it's a notification
+                if response.code == OpCode.NOTIFY:
+                    task_id = response.key
+                    try:
+                        task_data = json.loads(response.value)
+                    except json.JSONDecodeError:
+                        task_data = {"id": task_id, "raw": response.value}
+
+                    # Find and call the appropriate callback
+                    task_type = task_data.get('task_type', '')
+                    if hasattr(self, '_notification_callbacks'):
+                        callback = self._notification_callbacks.get(task_type)
+                        if callback:
+                            try:
+                                callback(task_data)
+                            except Exception:
+                                pass  # Don't let callback errors crash the listener
+
+            except socket.timeout:
+                continue  # Normal timeout, keep listening
+            except Exception:
+                break  # Connection error, stop listener
+
+        self._listener_running = False
+
+    def stop_listener(self) -> None:
+        """Stop the notification listener thread."""
+        self._listener_running = False
+        if hasattr(self, '_listener_thread') and self._listener_thread:
+            self._listener_thread.join(timeout=2.0)
+
+    # ==================== Task Management ====================
+
+    def create_task(
+        self,
+        task_type: str,
+        data: Union[str, Dict[str, Any]],
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Create a task for distribution to subscribed agents.
+
+        Args:
+            task_type: Type of task (e.g., "research", "summarize")
+            data: Task data (string or dict, will be JSON encoded if dict)
+
+        Returns:
+            Tuple of (task_id, assigned_agent_id or None if pending)
+        """
+        if isinstance(data, dict):
+            data = json.dumps(data)
+
+        msg = Message(
+            code=OpCode.TASK_CREATE,
+            key=task_type,
+            value=data,
+        )
+        response = self._execute(msg)
+        self._check_permission(response)
+
+        task_id = response.key
+        assigned = response.value if not response.not_found else None
+
+        return (task_id, assigned)
+
+    def complete_task(self, task_id: str, result: Union[str, Dict[str, Any]]) -> bool:
+        """
+        Mark a task as completed with a result.
+
+        Args:
+            task_id: ID of the task to complete
+            result: Result data (string or dict)
+
+        Returns:
+            True if task was found and completed, False otherwise
+        """
+        if isinstance(result, dict):
+            result = json.dumps(result)
+
+        msg = Message(
+            code=OpCode.TASK_COMPLETE,
+            key=task_id,
+            value=result,
+        )
+        response = self._execute(msg)
+        self._check_permission(response)
+
+        return not response.not_found
+
+    def fail_task(self, task_id: str, error: str) -> bool:
+        """
+        Mark a task as failed with an error message.
+
+        Args:
+            task_id: ID of the task to fail
+            error: Error message describing the failure
+
+        Returns:
+            True if task was found and marked as failed, False otherwise
+        """
+        msg = Message(
+            code=OpCode.TASK_FAIL,
+            key=task_id,
+            value=error,
+        )
+        response = self._execute(msg)
+        self._check_permission(response)
+
+        return not response.not_found
+
+    def task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the status of a task.
+
+        Args:
+            task_id: ID of the task
+
+        Returns:
+            Task data dict if found, None otherwise
+        """
+        msg = Message(
+            code=OpCode.TASK_STATUS,
+            key=task_id,
+            value="",
+        )
+        response = self._execute(msg)
+
+        if response.not_found:
+            return None
+
+        try:
+            return json.loads(response.value)
+        except json.JSONDecodeError:
+            return {"id": task_id, "status": response.value}
+
+    def list_tasks(
+        self,
+        task_type: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        List tasks with optional filters.
+
+        Args:
+            task_type: Filter by task type (optional)
+            status: Filter by status: "pending", "claimed", "completed", "failed" (optional)
+
+        Returns:
+            List of task dicts
+        """
+        msg = Message(
+            code=OpCode.TASK_LIST,
+            key=task_type or "",
+            value=status or "",
+        )
+        response = self._execute(msg)
+
+        try:
+            return json.loads(response.value)
+        except json.JSONDecodeError:
+            return []
+
+    def claim_task(self, task_id: str, agent_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Manually claim a pending task.
+
+        Args:
+            task_id: ID of the task to claim
+            agent_id: Agent ID claiming the task (uses stored ID if not provided)
+
+        Returns:
+            Task data dict if claimed successfully, None if task not found or already claimed
+        """
+        aid = agent_id or getattr(self, '_agent_id', '')
+        msg = Message(
+            code=OpCode.TASK_CLAIM,
+            key=task_id,
+            value=aid or "",
+        )
+        response = self._execute(msg)
+        self._check_permission(response)
+
+        if response.not_found:
+            return None
+
+        try:
+            return json.loads(response.value)
+        except json.JSONDecodeError:
+            return {"id": task_id, "status": "claimed"}

@@ -52,6 +52,17 @@ class OpCode(IntEnum):
     USER_PASSWD = 63
     USER_ROLE = 64
     WHOAMI = 65
+    # Pub/Sub operations (Agent Coordination)
+    SUBSCRIBE = 70
+    UNSUBSCRIBE = 71
+    NOTIFY = 72
+    # Task management operations
+    TASK_CREATE = 73
+    TASK_COMPLETE = 74
+    TASK_FAIL = 75
+    TASK_STATUS = 76
+    TASK_LIST = 77
+    TASK_CLAIM = 78
 
 
 # Header size: code(2) + db_id_len(4) + key_len(4) + value_len(4) = 14 bytes

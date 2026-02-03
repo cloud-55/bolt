@@ -66,3 +66,16 @@ pub const OP_USER_LIST: u16 = 62;
 pub const OP_USER_PASSWD: u16 = 63;
 pub const OP_USER_ROLE: u16 = 64;
 pub const OP_WHOAMI: u16 = 65;
+
+// Pub/Sub operations (Agent Coordination)
+pub const OP_SUBSCRIBE: u16 = 70;      // SUBSCRIBE <task_type> <agent_id>
+pub const OP_UNSUBSCRIBE: u16 = 71;    // UNSUBSCRIBE <task_type> <agent_id>
+pub const OP_NOTIFY: u16 = 72;         // NOTIFY <task_data> (server → client)
+
+// Task management operations
+pub const OP_TASK_CREATE: u16 = 73;    // Create task for distribution
+pub const OP_TASK_COMPLETE: u16 = 74;  // Mark task as completed
+pub const OP_TASK_FAIL: u16 = 75;      // Mark task as failed
+pub const OP_TASK_STATUS: u16 = 76;    // Get task status
+pub const OP_TASK_LIST: u16 = 77;      // List tasks by type/status
+pub const OP_TASK_CLAIM: u16 = 78;     // Manually claim a task

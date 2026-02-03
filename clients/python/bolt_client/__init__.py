@@ -28,6 +28,7 @@ from .exceptions import (
     KeyNotFoundError,
     PermissionError,
     ClusterError,
+    UnsupportedOperationError,
 )
 
 __version__ = "0.1.0"
@@ -39,4 +40,5 @@ __all__ = [
     "KeyNotFoundError",
     "PermissionError",
     "ClusterError",
+    "UnsupportedOperationError",
 ]

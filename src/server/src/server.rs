@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use log::info;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
 use crate::auth::{UserStore, Session, UserRole, AuthError};
@@ -13,6 +13,7 @@ use crate::error::ServerError;
 use crate::message::Message;
 use crate::metrics::Metrics;
 use crate::opcodes::*;
+use crate::pubsub::{SubscriptionManager, Task, TaskStatus, Notification};
 use crate::tls::TlsConfig;
 use crate::http_metrics::HttpMetricsServer;
 use cluster::{ClusterConfig, ClusterManager, ReplicationEntry, ReplicationOp};
@@ -31,6 +32,7 @@ pub struct Server {
     tls_acceptor: Option<TlsAcceptor>,
     max_connections: usize,
     cluster: Option<Arc<ClusterManager>>,
+    pubsub: Arc<SubscriptionManager>,
 }
 
 impl Server {
@@ -200,6 +202,7 @@ impl Server {
             tls_acceptor,
             max_connections,
             cluster,
+            pubsub: Arc::new(SubscriptionManager::new()),
         })
     }
 
@@ -286,6 +289,7 @@ impl Server {
                             let tls_acceptor = self.tls_acceptor.clone();
                             let max_connections = self.max_connections;
                             let cluster = self.cluster.clone();
+                            let pubsub = self.pubsub.clone();
 
                             metrics.active_connections.fetch_add(1, Ordering::SeqCst);
                             metrics.total_connections.fetch_add(1, Ordering::SeqCst);
@@ -296,7 +300,7 @@ impl Server {
                                     // TLS connection
                                     match acceptor.accept(stream).await {
                                         Ok(tls_stream) => {
-                                            handle_client(tls_stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster).await
+                                            handle_client(tls_stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster, pubsub).await
                                         }
                                         Err(e) => {
                                             info!("TLS handshake failed: {}", e);
@@ -305,7 +309,7 @@ impl Server {
                                     }
                                 } else {
                                     // Plain TCP connection
-                                    handle_client(stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster).await
+                                    handle_client(stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster, pubsub).await
                                 };
 
                                 metrics.active_connections.fetch_sub(1, Ordering::SeqCst);
@@ -355,6 +359,7 @@ async fn handle_client<S>(
     user_store: UserStore,
     metrics: Arc<Metrics>,
     cluster: Option<Arc<ClusterManager>>,
+    pubsub: Arc<SubscriptionManager>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -379,17 +384,34 @@ where
         }
     }
 
+    // Create notification channel for Pub/Sub
+    let (notify_tx, mut notify_rx) = mpsc::channel::<Notification>(100);
+
+    // Track agent_id for this connection (set when subscribing)
+    let mut agent_id: Option<String> = None;
+
     // Process messages
     loop {
         tokio::select! {
             result = Message::receive_async(&mut stream) => {
                 match result {
                     Ok(message) => {
-                        if let Err(e) = process_message(&message, &storage, &mut stream, &metrics, &cluster, &session, &user_store).await {
+                        if let Err(e) = process_message(
+                            &message, &storage, &mut stream, &metrics, &cluster,
+                            &session, &user_store, &pubsub, &notify_tx, &mut agent_id
+                        ).await {
+                            // Clean up subscriptions on error
+                            if let Some(ref aid) = agent_id {
+                                pubsub.remove_agent(aid).await;
+                            }
                             return Err(e);
                         }
                     }
                     Err(e) => {
+                        // Clean up subscriptions on disconnect
+                        if let Some(ref aid) = agent_id {
+                            pubsub.remove_agent(aid).await;
+                        }
                         if e.kind() == std::io::ErrorKind::UnexpectedEof {
                             return Ok(());
                         }
@@ -397,7 +419,30 @@ where
                     }
                 }
             }
+            // Handle incoming notifications (push to subscribed agents)
+            Some(notification) = notify_rx.recv() => {
+                // Send notification to client
+                let task_json = serde_json::to_string(&notification.task).unwrap_or_default();
+                let response = Message {
+                    code: OP_NOTIFY,
+                    key: notification.task.id.clone(),
+                    value: task_json,
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                if let Err(e) = response.send_async(&mut stream).await {
+                    // Clean up on send error
+                    if let Some(ref aid) = agent_id {
+                        pubsub.remove_agent(aid).await;
+                    }
+                    return Err(e);
+                }
+            }
             _ = shutdown_rx.recv() => {
+                // Clean up subscriptions on shutdown
+                if let Some(ref aid) = agent_id {
+                    pubsub.remove_agent(aid).await;
+                }
                 info!("Client handler received shutdown signal");
                 return Ok(());
             }
@@ -501,6 +546,9 @@ async fn process_message<S>(
     cluster: &Option<Arc<ClusterManager>>,
     session: &Session,
     user_store: &UserStore,
+    pubsub: &Arc<SubscriptionManager>,
+    notify_tx: &mpsc::Sender<Notification>,
+    agent_id: &mut Option<String>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -511,7 +559,8 @@ where
         OP_PUT | OP_DEL | OP_SETEX | OP_MSET | OP_MDEL |
         OP_INCR | OP_DECR | OP_INCRBY |
         OP_LPUSH | OP_RPUSH | OP_LPOP | OP_RPOP |
-        OP_SADD | OP_SREM
+        OP_SADD | OP_SREM |
+        OP_TASK_CREATE | OP_TASK_COMPLETE | OP_TASK_FAIL | OP_TASK_CLAIM
     );
 
     if requires_write && !session.can_write() {
@@ -1701,6 +1750,264 @@ where
             };
             response.send_async(stream).await?;
         }
+
+        // ===== Pub/Sub Operations =====
+
+        OP_SUBSCRIBE => {
+            // key = task_type, value = agent_id
+            let task_type = &message.key;
+            let aid = &message.value;
+
+            if task_type.is_empty() || aid.is_empty() {
+                let response = Message {
+                    code: OP_SUBSCRIBE,
+                    key: String::new(),
+                    value: "Error: task_type and agent_id required".to_string(),
+                    not_found: true,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+            } else {
+                // Store agent_id for this connection
+                *agent_id = Some(aid.clone());
+
+                // Subscribe to task type
+                pubsub.subscribe(task_type, aid, notify_tx.clone()).await;
+
+                let response = Message {
+                    code: OP_SUBSCRIBE,
+                    key: task_type.clone(),
+                    value: format!("Subscribed {} to {}", aid, task_type),
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                info!("Agent '{}' subscribed to task type '{}'", aid, task_type);
+            }
+        }
+
+        OP_UNSUBSCRIBE => {
+            // key = task_type, value = agent_id
+            let task_type = &message.key;
+            let aid = message.value.as_str();
+
+            // Use stored agent_id if not provided
+            let aid = if aid.is_empty() {
+                agent_id.as_deref().unwrap_or("")
+            } else {
+                aid
+            };
+
+            if task_type.is_empty() || aid.is_empty() {
+                let response = Message {
+                    code: OP_UNSUBSCRIBE,
+                    key: String::new(),
+                    value: "Error: task_type required".to_string(),
+                    not_found: true,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+            } else {
+                pubsub.unsubscribe(task_type, aid).await;
+
+                let response = Message {
+                    code: OP_UNSUBSCRIBE,
+                    key: task_type.clone(),
+                    value: format!("Unsubscribed {} from {}", aid, task_type),
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                info!("Agent '{}' unsubscribed from task type '{}'", aid, task_type);
+            }
+        }
+
+        OP_TASK_CREATE => {
+            // key = task_type, value = JSON data
+            let task_type = &message.key;
+            let data = &message.value;
+
+            if task_type.is_empty() {
+                let response = Message {
+                    code: OP_TASK_CREATE,
+                    key: String::new(),
+                    value: "Error: task_type required".to_string(),
+                    not_found: true,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+            } else {
+                let task_id = uuid::Uuid::new_v4().to_string();
+                let timestamp = current_timestamp_ms();
+                let task = Task::new(task_id.clone(), task_type.clone(), data.clone(), timestamp);
+
+                let (_, assigned_agent) = pubsub.create_task(task).await;
+
+                let response = Message {
+                    code: OP_TASK_CREATE,
+                    key: task_id.clone(),
+                    value: assigned_agent.clone().unwrap_or_else(|| "pending".to_string()),
+                    not_found: assigned_agent.is_none(),
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                info!("Task '{}' created (type: {}, assigned: {:?})", task_id, task_type, assigned_agent);
+            }
+        }
+
+        OP_TASK_COMPLETE => {
+            // key = task_id, value = JSON result
+            let task_id = &message.key;
+            let result = &message.value;
+
+            if task_id.is_empty() {
+                let response = Message {
+                    code: OP_TASK_COMPLETE,
+                    key: String::new(),
+                    value: "Error: task_id required".to_string(),
+                    not_found: true,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+            } else {
+                let success = pubsub.complete_task(task_id, result.clone()).await;
+
+                let response = Message {
+                    code: OP_TASK_COMPLETE,
+                    key: task_id.clone(),
+                    value: if success { "completed".to_string() } else { "not found".to_string() },
+                    not_found: !success,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                if success {
+                    info!("Task '{}' completed", task_id);
+                }
+            }
+        }
+
+        OP_TASK_FAIL => {
+            // key = task_id, value = error message
+            let task_id = &message.key;
+            let error = &message.value;
+
+            if task_id.is_empty() {
+                let response = Message {
+                    code: OP_TASK_FAIL,
+                    key: String::new(),
+                    value: "Error: task_id required".to_string(),
+                    not_found: true,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+            } else {
+                let success = pubsub.fail_task(task_id, error.clone()).await;
+
+                let response = Message {
+                    code: OP_TASK_FAIL,
+                    key: task_id.clone(),
+                    value: if success { "failed".to_string() } else { "not found".to_string() },
+                    not_found: !success,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                if success {
+                    info!("Task '{}' failed: {}", task_id, error);
+                }
+            }
+        }
+
+        OP_TASK_STATUS => {
+            // key = task_id
+            let task_id = &message.key;
+
+            if let Some(task) = pubsub.get_task(task_id).await {
+                let task_json = serde_json::to_string(&task).unwrap_or_default();
+                let response = Message {
+                    code: OP_TASK_STATUS,
+                    key: task_id.clone(),
+                    value: task_json,
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+            } else {
+                let response = Message {
+                    code: OP_TASK_STATUS,
+                    key: task_id.clone(),
+                    value: "Task not found".to_string(),
+                    not_found: true,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+            }
+        }
+
+        OP_TASK_LIST => {
+            // key = task_type (optional), value = status filter (optional: pending, claimed, completed, failed)
+            let task_type = if message.key.is_empty() { None } else { Some(message.key.as_str()) };
+            let status = match message.value.to_lowercase().as_str() {
+                "pending" => Some(TaskStatus::Pending),
+                "claimed" => Some(TaskStatus::Claimed),
+                "completed" => Some(TaskStatus::Completed),
+                "failed" => Some(TaskStatus::Failed),
+                _ => None,
+            };
+
+            let tasks = pubsub.list_tasks(task_type, status).await;
+            let tasks_json = serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string());
+
+            let response = Message {
+                code: OP_TASK_LIST,
+                key: format!("{}", tasks.len()),
+                value: tasks_json,
+                not_found: tasks.is_empty(),
+                database_id: DatabaseId::Default,
+            };
+            response.send_async(stream).await?;
+        }
+
+        OP_TASK_CLAIM => {
+            // key = task_id, value = agent_id
+            let task_id = &message.key;
+            let aid = if message.value.is_empty() {
+                agent_id.as_deref().unwrap_or("")
+            } else {
+                message.value.as_str()
+            };
+
+            if task_id.is_empty() || aid.is_empty() {
+                let response = Message {
+                    code: OP_TASK_CLAIM,
+                    key: String::new(),
+                    value: "Error: task_id and agent_id required".to_string(),
+                    not_found: true,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+            } else if let Some(task) = pubsub.claim_task(task_id, aid).await {
+                let task_json = serde_json::to_string(&task).unwrap_or_default();
+                let response = Message {
+                    code: OP_TASK_CLAIM,
+                    key: task_id.clone(),
+                    value: task_json,
+                    not_found: false,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+                info!("Task '{}' claimed by agent '{}'", task_id, aid);
+            } else {
+                let response = Message {
+                    code: OP_TASK_CLAIM,
+                    key: task_id.clone(),
+                    value: "Task not found or already claimed".to_string(),
+                    not_found: true,
+                    database_id: DatabaseId::Default,
+                };
+                response.send_async(stream).await?;
+            }
+        }
+
         _ => {
             info!("Unknown operation: {}", message.code);
         }

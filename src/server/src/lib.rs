@@ -4,6 +4,7 @@ pub mod http_metrics;
 pub mod message;
 pub mod metrics;
 pub mod opcodes;
+pub mod pubsub;
 pub mod server;
 pub mod tls;
 
@@ -11,6 +12,7 @@ pub mod tls;
 pub use error::ServerError;
 pub use metrics::Metrics;
 pub use opcodes::*;
+pub use pubsub::{SubscriptionManager, Task, TaskStatus, Notification};
 
 // Re-export cluster types from cluster crate for backwards compatibility
 pub use cluster::{
