@@ -11,6 +11,8 @@
 
 Bolt is a high-performance in-memory database designed for AI agent infrastructure. It provides the stateful backbone that autonomous agents need: ultra-low latency state management, distributed coordination, and real-time synchronization across agent swarms.
 
+<img src="./assets/demoo.gif" width="100%" />
+
 ## Why Bolt for AI Agents?
 
 Modern AI agents need persistent state that's **faster than their decision loop**. Traditional databases add latency that breaks the real-time feedback agents require. Bolt solves this with:
@@ -462,7 +464,7 @@ with client:
 
 ### Multi-Master Architecture
 
-All nodes accept reads AND writes — no single point of failure.
+True multi-master: all nodes are equal, all accept reads and writes.
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
