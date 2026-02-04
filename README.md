@@ -1,5 +1,12 @@
 # Bolt
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Docker Pulls](https://img.shields.io/docker/pulls/cloud55io/bolt)](https://hub.docker.com/r/cloud55io/bolt)
+[![Docker Image Size](https://img.shields.io/docker/image-size/cloud55io/bolt/latest)](https://hub.docker.com/r/cloud55io/bolt)
+[![GitHub Stars](https://img.shields.io/github/stars/cloud-55/bolt)](https://github.com/cloud-55/bolt)
+[![GitHub Contributors](https://img.shields.io/github/contributors/cloud-55/bolt)](https://github.com/cloud-55/bolt/graphs/contributors)
+[![GitHub Issues](https://img.shields.io/github/issues/cloud-55/bolt)](https://github.com/cloud-55/bolt/issues)
+
 > The state engine for AI agents: fast, distributed, and built for agentic workloads.
 
 Bolt is a high-performance in-memory database designed for AI agent infrastructure. It provides the stateful backbone that autonomous agents need: ultra-low latency state management, distributed coordination, and real-time synchronization across agent swarms.
@@ -290,7 +297,7 @@ curl -X POST http://localhost:8000/tasks -H "Content-Type: application/json" \
 ### Quick Install (Linux/macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cloud55/bolt/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cloud-55/bolt/main/install.sh | bash
 ```
 
 This installs `bolt` (server) and `boltctl` (CLI) to `/usr/local/bin`.
@@ -304,7 +311,7 @@ docker run -p 2012:2012 cloud55io/bolt
 ### From Source
 
 ```bash
-git clone https://github.com/cloud55/bolt.git
+git clone https://github.com/cloud-55/bolt.git
 cd bolt
 cargo build --release
 
@@ -664,4 +671,4 @@ cargo clippy
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+Apache License 2.0 - see [LICENSE](LICENSE) for details.

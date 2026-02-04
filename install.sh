@@ -2,9 +2,9 @@
 set -e
 
 # Bolt Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/cloud55/bolt/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/cloud-55/bolt/main/install.sh | bash
 
-REPO="cloud55/bolt"
+REPO="cloud-55/bolt"
 INSTALL_DIR="${BOLT_INSTALL_DIR:-/usr/local/bin}"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases/latest"
 GITHUB_DOWNLOAD="https://github.com/${REPO}/releases/download"
