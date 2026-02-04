@@ -175,11 +175,30 @@ main() {
         error "Installation verification failed"
     fi
 
+    # Start server if requested
+    if [ "${BOLT_START:-false}" = "true" ] || [ "${BOLT_START:-0}" = "1" ]; then
+        info "Starting Bolt server in background..."
+        "$INSTALL_DIR/bolt" > /dev/null 2>&1 &
+        sleep 1
+        if pgrep -x bolt > /dev/null; then
+            success "Bolt server started (PID: $(pgrep -x bolt))"
+            echo ""
+            echo "Server running on port 8518"
+            echo "Stop with: pkill bolt"
+        else
+            warn "Failed to start server"
+        fi
+    fi
+
     echo ""
     echo "Quick Start:"
-    echo "  bolt                    # Start the server"
+    echo "  bolt                    # Start the server (foreground)"
+    echo "  bolt > /dev/null 2>&1 & # Start in background"
     echo "  boltctl put key value   # Store a value"
     echo "  boltctl get key         # Retrieve a value"
+    echo ""
+    echo "To auto-start server on install:"
+    echo "  BOLT_START=true curl -fsSL ... | bash"
     echo ""
     echo "Documentation: https://github.com/${REPO}"
     echo ""
