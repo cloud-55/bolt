@@ -160,17 +160,19 @@ main() {
 
     # Verify installation
     echo ""
-    if command -v bolt &> /dev/null; then
-        info "Verifying installation..."
-        bolt --version 2>/dev/null || true
+    if [ -x "$INSTALL_DIR/bolt" ] && [ -x "$INSTALL_DIR/boltctl" ]; then
         success "Installation complete!"
+
+        if ! command -v bolt &> /dev/null; then
+            warn "bolt is not in PATH"
+            echo ""
+            echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
+            echo ""
+            echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+            echo ""
+        fi
     else
-        warn "bolt is installed but not in PATH"
-        echo ""
-        echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-        echo ""
-        echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
-        echo ""
+        error "Installation verification failed"
     fi
 
     echo ""
