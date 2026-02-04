@@ -158,6 +158,23 @@ main() {
     success "Installed bolt to $INSTALL_DIR/bolt"
     success "Installed boltctl to $INSTALL_DIR/boltctl"
 
+    # Create default config file (~/.boltrc) if it doesn't exist
+    local config_file="$HOME/.boltrc"
+    if [ ! -f "$config_file" ]; then
+        info "Creating default config at $config_file"
+        cat > "$config_file" << 'EOF'
+host = "127.0.0.1"
+port = 8518
+username = "admin"
+password = "admin"
+EOF
+        chmod 600 "$config_file"
+        success "Config created with default credentials (admin/admin)"
+        warn "Change password with: boltctl passwd admin <new_password>"
+    else
+        info "Config file already exists at $config_file"
+    fi
+
     # Verify installation
     echo ""
     if [ -x "$INSTALL_DIR/bolt" ] && [ -x "$INSTALL_DIR/boltctl" ]; then
@@ -192,13 +209,12 @@ main() {
 
     echo ""
     echo "Quick Start:"
-    echo "  bolt                    # Start the server (foreground)"
-    echo "  bolt > /dev/null 2>&1 & # Start in background"
     echo "  boltctl put key value   # Store a value"
     echo "  boltctl get key         # Retrieve a value"
     echo ""
-    echo "To auto-start server on install:"
-    echo "  BOLT_START=true curl -fsSL ... | bash"
+    echo "Authentication:"
+    echo "  Credentials are saved in ~/.boltrc (default: admin/admin)"
+    echo "  Change password: boltctl passwd admin <new_password>"
     echo ""
     echo "Documentation: https://github.com/${REPO}"
     echo ""

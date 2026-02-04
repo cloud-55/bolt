@@ -1,4 +1,5 @@
 mod commands;
+mod config;
 mod message;
 mod opcodes;
 
@@ -7,6 +8,7 @@ use std::io::Result;
 use std::net::TcpStream;
 
 use commands::*;
+use config::Config;
 use message::Message;
 use opcodes::*;
 
@@ -55,6 +57,10 @@ fn print_usage() {
     eprintln!("  boltctl type <key> [database_id]");
     eprintln!("  boltctl keys <pattern> [database_id]");
     eprintln!();
+    eprintln!("Authentication:");
+    eprintln!("  boltctl login <username> <password>           - Save credentials to ~/.boltrc");
+    eprintln!("  boltctl logout                                - Remove saved credentials");
+    eprintln!();
     eprintln!("User management (Admin only):");
     eprintln!("  boltctl useradd <username> <password> <role>  - Create user (role: admin|readwrite|readonly)");
     eprintln!("  boltctl userdel <username>                    - Delete user");
@@ -68,7 +74,7 @@ fn print_usage() {
     eprintln!("  boltctl metrics");
     eprintln!("  boltctl cluster");
     eprintln!();
-    eprintln!("Environment variables:");
+    eprintln!("Configuration (priority: env vars > ~/.boltrc > defaults):");
     eprintln!("  BOLT_HOST     - Server host (default: 127.0.0.1)");
     eprintln!("  BOLT_PORT     - Server port (default: 8518)");
     eprintln!("  BOLT_USER     - Username for authentication");
@@ -127,21 +133,92 @@ fn main() -> Result<()> {
 
     let command = &args[1];
 
-    let host = env::var("BOLT_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
-    let port_str = env::var("BOLT_PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
-    let port: u16 = match port_str.parse() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Error: Invalid port number '{}': {}", port_str, e);
-            std::process::exit(1);
+    // Load config from ~/.boltrc (if exists)
+    let config = Config::load().unwrap_or_default();
+
+    // Priority: env vars > config file > defaults
+    let host = env::var("BOLT_HOST")
+        .ok()
+        .or(config.host)
+        .unwrap_or_else(|| DEFAULT_HOST.to_string());
+
+    let port: u16 = env::var("BOLT_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or(config.port)
+        .unwrap_or_else(|| DEFAULT_PORT.parse().unwrap());
+
+    // Get credentials: env vars take priority over config file
+    let username = env::var("BOLT_USER").ok().or(config.username.clone());
+    let password = env::var("BOLT_PASSWORD").ok().or(config.password.clone());
+
+    // Handle login/logout commands before connecting (they may not need connection or need special handling)
+    match command.as_str() {
+        "login" => {
+            if args.len() < 4 {
+                eprintln!("Error: login requires <username> <password>");
+                eprintln!("Usage: boltctl login <username> <password>");
+                std::process::exit(1);
+            }
+            let login_user = &args[2];
+            let login_pass = &args[3];
+
+            // Try to connect and authenticate
+            let mut stream = TcpStream::connect(format!("{}:{}", &host, &port))?;
+            match authenticate(&mut stream, login_user, login_pass) {
+                Ok(()) => {
+                    // Save credentials to config file
+                    let mut new_config = Config::load().unwrap_or_default();
+                    new_config.host = Some(host);
+                    new_config.port = Some(port);
+                    new_config.username = Some(login_user.clone());
+                    new_config.password = Some(login_pass.clone());
+
+                    match new_config.save() {
+                        Ok(()) => {
+                            let config_path = Config::path().unwrap_or_default();
+                            println!("Logged in as '{}'. Credentials saved to {:?}", login_user, config_path);
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Login successful but failed to save credentials: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Login failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
         }
-    };
+        "logout" => {
+            match Config::load() {
+                Ok(mut cfg) => {
+                    if cfg.has_credentials() {
+                        cfg.clear_credentials();
+                        if let Err(e) = cfg.save() {
+                            eprintln!("Error clearing credentials: {}", e);
+                            std::process::exit(1);
+                        }
+                        println!("Logged out. Credentials removed from ~/.boltrc");
+                    } else {
+                        println!("No credentials found in ~/.boltrc");
+                    }
+                }
+                Err(_) => {
+                    println!("No credentials found (config file doesn't exist)");
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
 
     let mut stream = TcpStream::connect(format!("{}:{}", &host, &port))?;
 
-    // Authenticate if credentials are provided
-    if let (Ok(username), Ok(password)) = (env::var("BOLT_USER"), env::var("BOLT_PASSWORD")) {
-        authenticate(&mut stream, &username, &password)?;
+    // Authenticate if credentials are available (from env or config)
+    if let (Some(user), Some(pass)) = (username, password) {
+        authenticate(&mut stream, &user, &pass)?;
     }
 
     match command.as_str() {

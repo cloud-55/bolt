@@ -10,6 +10,9 @@ name = "boltctl"
 
 [dependencies]
 byteordered = "0.6.0"
+serde = { version = "1", features = ["derive"] }
+toml = "0.5"
+dirs = "4"
 
 [profile.release]
 lto = true
