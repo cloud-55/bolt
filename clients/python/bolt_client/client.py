@@ -24,7 +24,7 @@ class BoltConnection:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 2012,
+        port: int = 8518,
         timeout: float = 30.0,
     ):
         self.host = host
@@ -130,11 +130,11 @@ class BoltClient:
 
     Example usage:
         # Single node
-        client = BoltClient(host="127.0.0.1", port=2012, username="admin", password="admin")
+        client = BoltClient(host="127.0.0.1", port=8518, username="admin", password="admin")
 
         # Cluster mode
         client = BoltClient.cluster(
-            nodes=["127.0.0.1:2012", "127.0.0.1:2013", "127.0.0.1:2014"],
+            nodes=["127.0.0.1:8518", "127.0.0.1:8528", "127.0.0.1:8538"],
             username="admin",
             password="admin"
         )
@@ -148,7 +148,7 @@ class BoltClient:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 2012,
+        port: int = 8518,
         username: Optional[str] = None,
         password: Optional[str] = None,
         database: Optional[str] = None,
@@ -198,7 +198,7 @@ class BoltClient:
                 port = int(parts[1])
             else:
                 host = node
-                port = 2012
+                port = 8518
             parsed_nodes.append((host, port))
 
         client = cls(

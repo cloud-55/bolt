@@ -23,7 +23,7 @@ from bolt_client import BoltClient
 # Connect to a single node
 client = BoltClient(
     host="127.0.0.1",
-    port=2012,
+    port=8518,
     username="admin",
     password="admin"
 )
@@ -41,7 +41,7 @@ from bolt_client import BoltClient
 
 # Connect to a cluster (multi-master)
 client = BoltClient.cluster(
-    nodes=["127.0.0.1:2012", "127.0.0.1:2022", "127.0.0.1:2032"],
+    nodes=["127.0.0.1:8518", "127.0.0.1:8528", "127.0.0.1:8538"],
     username="admin",
     password="admin"
 )
@@ -56,7 +56,7 @@ value = client.get("key")
 ```python
 from bolt_client import BoltClient
 
-with BoltClient(host="127.0.0.1", port=2012, username="admin", password="admin") as client:
+with BoltClient(host="127.0.0.1", port=8518, username="admin", password="admin") as client:
     client.put("key", "value")
     value = client.get("key")
 # Connection automatically closed
@@ -177,7 +177,7 @@ cluster = client.cluster_status()
 
 ```python
 # Set default database
-client = BoltClient(host="127.0.0.1", port=2012, database="mydb")
+client = BoltClient(host="127.0.0.1", port=8518, database="mydb")
 
 # Or specify per-operation
 client.put("key", "value", database="other_db")
@@ -198,7 +198,7 @@ from bolt_client import (
 )
 
 try:
-    client = BoltClient(host="127.0.0.1", port=2012)
+    client = BoltClient(host="127.0.0.1", port=8518)
     client.connect()
 except ConnectionError as e:
     print(f"Failed to connect: {e}")
@@ -217,7 +217,7 @@ except BoltError as e:
 ```python
 client = BoltClient(
     host="127.0.0.1",      # Server host
-    port=2012,             # Server port
+    port=8518,             # Server port
     username="admin",      # Auth username
     password="admin",      # Auth password
     database="default",    # Default database

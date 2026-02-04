@@ -23,11 +23,11 @@ pub struct ClusterConfig {
 impl ClusterConfig {
     pub fn from_env() -> Option<Self> {
         let node_id = std::env::var("BOLT_NODE_ID").ok()?;
-        let cluster_port_str = std::env::var("BOLT_CLUSTER_PORT").unwrap_or_else(|_| "2013".to_string());
+        let cluster_port_str = std::env::var("BOLT_CLUSTER_PORT").unwrap_or_else(|_| "8519".to_string());
         let cluster_port = cluster_port_str.parse().ok()?;
 
-        let client_port_str = std::env::var("BOLT_PORT").unwrap_or_else(|_| "2012".to_string());
-        let client_port = client_port_str.parse().unwrap_or(2012);
+        let client_port_str = std::env::var("BOLT_PORT").unwrap_or_else(|_| "8518".to_string());
+        let client_port = client_port_str.parse().unwrap_or(8518);
 
         let peers_str = std::env::var("BOLT_CLUSTER_PEERS").unwrap_or_default();
         let peers: Vec<String> = if peers_str.is_empty() {

@@ -8,7 +8,7 @@ Example usage:
     from bolt_client import BoltClient
     from bolt_agents import TaskCoordinator, Task
 
-    client = BoltClient(host="localhost", port=2012, username="admin", password="secret")
+    client = BoltClient(host="localhost", port=8518, username="admin", password="secret")
     client.connect()
 
     coord = TaskCoordinator(client)

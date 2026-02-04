@@ -383,7 +383,7 @@ impl ClusterManager {
             let info_parts: Vec<&str> = peer_info.split(':').collect();
             if info_parts.len() >= 3 {
                 let peer_id = info_parts[0].to_string();
-                let client_port: u16 = info_parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(2012);
+                let client_port: u16 = info_parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(8518);
                 let peer_role = match info_parts.get(2) {
                     Some(&"leader") => NodeRole::Leader,
                     _ => NodeRole::Follower,
@@ -798,8 +798,8 @@ async fn handle_cluster_connection(
                 let parts: Vec<&str> = join_info.split(':').collect();
                 if parts.len() >= 2 {
                     let peer_id = parts[0].to_string();
-                    let cluster_port: u16 = parts[1].parse().unwrap_or(2013);
-                    let client_port: u16 = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(2012);
+                    let cluster_port: u16 = parts[1].parse().unwrap_or(8519);
+                    let client_port: u16 = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(8518);
 
                     let peer_addr = stream.peer_addr()?;
                     let host = peer_addr.ip().to_string();

@@ -9,7 +9,7 @@ def main():
     print("=== Single Node Connection ===")
     client = BoltClient(
         host="127.0.0.1",
-        port=2012,
+        port=8518,
         username="admin",
         password="admin"
     )
@@ -104,7 +104,7 @@ def cluster_example():
 
     # Connect to cluster
     client = BoltClient.cluster(
-        nodes=["127.0.0.1:2012", "127.0.0.1:2013", "127.0.0.1:2014"],
+        nodes=["127.0.0.1:8518", "127.0.0.1:8528", "127.0.0.1:8538"],
         username="admin",
         password="admin"
     )

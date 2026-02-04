@@ -10,21 +10,21 @@ services:
     container_name: bolt-node1
     hostname: bolt-node1
     ports:
-      - "2012:2012"   # Client port
-      - "2013:2013"   # Cluster port
+      - "8518:8518"   # Client port
+      - "8519:8519"   # Cluster port
       - "9091:9091"   # Metrics port
     volumes:
       - bolt_node1_data:/data
     environment:
       - BOLT_HOST=0.0.0.0
-      - BOLT_PORT=2012
+      - BOLT_PORT=8518
       - BOLT_DATA_DIR=/data
       - BOLT_PERSIST=true
       - BOLT_HIGH_PERF=true
       - BOLT_ADMIN_PASSWORD=admin
       - BOLT_NODE_ID=node1
-      - BOLT_CLUSTER_PORT=2013
-      - BOLT_CLUSTER_PEERS=node2:bolt-node2:2013,node3:bolt-node3:2013
+      - BOLT_CLUSTER_PORT=8519
+      - BOLT_CLUSTER_PEERS=node2:bolt-node2:8519,node3:bolt-node3:8519
       - RUST_LOG=info
     networks:
       - bolt_cluster
@@ -36,21 +36,21 @@ services:
     container_name: bolt-node2
     hostname: bolt-node2
     ports:
-      - "2022:2012"   # Client port
-      - "2023:2013"   # Cluster port
+      - "2022:8518"   # Client port
+      - "2023:8519"   # Cluster port
       - "9092:9091"   # Metrics port
     volumes:
       - bolt_node2_data:/data
     environment:
       - BOLT_HOST=0.0.0.0
-      - BOLT_PORT=2012
+      - BOLT_PORT=8518
       - BOLT_DATA_DIR=/data
       - BOLT_PERSIST=true
       - BOLT_HIGH_PERF=true
       - BOLT_ADMIN_PASSWORD=admin
       - BOLT_NODE_ID=node2
-      - BOLT_CLUSTER_PORT=2013
-      - BOLT_CLUSTER_PEERS=node1:bolt-node1:2013,node3:bolt-node3:2013
+      - BOLT_CLUSTER_PORT=8519
+      - BOLT_CLUSTER_PEERS=node1:bolt-node1:8519,node3:bolt-node3:8519
       - RUST_LOG=info
     networks:
       - bolt_cluster
@@ -64,21 +64,21 @@ services:
     container_name: bolt-node3
     hostname: bolt-node3
     ports:
-      - "2032:2012"   # Client port
-      - "2033:2013"   # Cluster port
+      - "2032:8518"   # Client port
+      - "2033:8519"   # Cluster port
       - "9093:9091"   # Metrics port
     volumes:
       - bolt_node3_data:/data
     environment:
       - BOLT_HOST=0.0.0.0
-      - BOLT_PORT=2012
+      - BOLT_PORT=8518
       - BOLT_DATA_DIR=/data
       - BOLT_PERSIST=true
       - BOLT_HIGH_PERF=true
       - BOLT_ADMIN_PASSWORD=admin
       - BOLT_NODE_ID=node3
-      - BOLT_CLUSTER_PORT=2013
-      - BOLT_CLUSTER_PEERS=node1:bolt-node1:2013,node2:bolt-node2:2013
+      - BOLT_CLUSTER_PORT=8519
+      - BOLT_CLUSTER_PEERS=node1:bolt-node1:8519,node2:bolt-node2:8519
       - RUST_LOG=info
     networks:
       - bolt_cluster

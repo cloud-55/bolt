@@ -42,17 +42,17 @@ USER bolt
 
 # Default environment variables
 ENV BOLT_HOST=0.0.0.0
-ENV BOLT_PORT=2012
+ENV BOLT_PORT=8518
 ENV BOLT_DATA_DIR=/data
 ENV BOLT_LOG_LEVEL=info
 ENV RUST_LOG=info
 ENV BOLT_METRICS_PORT=9091
 
 # Expose ports
-# 2012 - Client port
-# 2013 - Cluster port
+# 8518 - Client port
+# 8519 - Cluster port
 # 9091 - Metrics port (Prometheus)
-EXPOSE 2012 2013 9091
+EXPOSE 8518 8519 9091
 
 # Health check using HTTP endpoint
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

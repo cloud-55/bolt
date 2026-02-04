@@ -33,7 +33,7 @@
 ```bash
 docker run -d \
   --name bolt \
-  -p 2012:2012 \
+  -p 8518:8518 \
   -p 9091:9091 \
   -v bolt-data:/data \
   cloud55io/bolt:0.0.5
@@ -65,7 +65,7 @@ services:
   bolt:
     image: cloud55io/bolt:0.0.5
     ports:
-      - "2012:2012"
+      - "8518:8518"
       - "9091:9091"
     volumes:
       - bolt-data:/data
@@ -88,14 +88,14 @@ services:
     image: cloud55io/bolt:0.0.5
     hostname: bolt-node1
     ports:
-      - "2012:2012"
+      - "8518:8518"
       - "9091:9091"
     volumes:
       - bolt-node1-data:/data
     environment:
       - BOLT_NODE_ID=node1
-      - BOLT_CLUSTER_PORT=2013
-      - BOLT_PEERS=node2@bolt-node2:2013,node3@bolt-node3:2013
+      - BOLT_CLUSTER_PORT=8519
+      - BOLT_PEERS=node2@bolt-node2:8519,node3@bolt-node3:8519
       - BOLT_PERSIST=true
       - BOLT_HIGH_PERF=true
 
@@ -103,14 +103,14 @@ services:
     image: cloud55io/bolt:0.0.5
     hostname: bolt-node2
     ports:
-      - "2022:2012"
+      - "2022:8518"
       - "9092:9091"
     volumes:
       - bolt-node2-data:/data
     environment:
       - BOLT_NODE_ID=node2
-      - BOLT_CLUSTER_PORT=2013
-      - BOLT_PEERS=node1@bolt-node1:2013,node3@bolt-node3:2013
+      - BOLT_CLUSTER_PORT=8519
+      - BOLT_PEERS=node1@bolt-node1:8519,node3@bolt-node3:8519
       - BOLT_PERSIST=true
       - BOLT_HIGH_PERF=true
 
@@ -118,14 +118,14 @@ services:
     image: cloud55io/bolt:0.0.5
     hostname: bolt-node3
     ports:
-      - "2032:2012"
+      - "2032:8518"
       - "9093:9091"
     volumes:
       - bolt-node3-data:/data
     environment:
       - BOLT_NODE_ID=node3
-      - BOLT_CLUSTER_PORT=2013
-      - BOLT_PEERS=node1@bolt-node1:2013,node2@bolt-node2:2013
+      - BOLT_CLUSTER_PORT=8519
+      - BOLT_PEERS=node1@bolt-node1:8519,node2@bolt-node2:8519
       - BOLT_PERSIST=true
       - BOLT_HIGH_PERF=true
 
@@ -140,7 +140,7 @@ volumes:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BOLT_HOST` | `0.0.0.0` | Listen address |
-| `BOLT_PORT` | `2012` | Client port |
+| `BOLT_PORT` | `8518` | Client port |
 | `BOLT_DATA_DIR` | `/data` | Data directory for WAL |
 | `BOLT_PERSIST` | `true` | Enable persistence |
 | `BOLT_HIGH_PERF` | `false` | Enable high-performance mode |
@@ -154,7 +154,7 @@ volumes:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BOLT_NODE_ID` | - | Node identifier (enables cluster mode) |
-| `BOLT_CLUSTER_PORT` | `2013` | Cluster communication port |
+| `BOLT_CLUSTER_PORT` | `8519` | Cluster communication port |
 | `BOLT_PEERS` | - | Comma-separated peers (`id@host:port`) |
 
 ### TLS Variables

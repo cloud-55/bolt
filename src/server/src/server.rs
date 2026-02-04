@@ -19,7 +19,7 @@ use crate::http_metrics::HttpMetricsServer;
 use cluster::{ClusterConfig, ClusterManager, ReplicationEntry, ReplicationOp};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: &str = "2012";
+const DEFAULT_PORT: &str = "8518";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 const DEFAULT_METRICS_PORT: &str = "9091";

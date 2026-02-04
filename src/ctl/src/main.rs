@@ -11,7 +11,7 @@ use message::Message;
 use opcodes::*;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: &str = "2012";
+const DEFAULT_PORT: &str = "8518";
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -70,7 +70,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Environment variables:");
     eprintln!("  BOLT_HOST     - Server host (default: 127.0.0.1)");
-    eprintln!("  BOLT_PORT     - Server port (default: 2012)");
+    eprintln!("  BOLT_PORT     - Server port (default: 8518)");
     eprintln!("  BOLT_USER     - Username for authentication");
     eprintln!("  BOLT_PASSWORD - Password for authentication");
 }

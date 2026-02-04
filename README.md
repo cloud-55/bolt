@@ -50,7 +50,7 @@ from bolt_client import BoltClient
 from bolt_agents import TaskCoordinator
 
 app = FastAPI()
-client = BoltClient(host="localhost", port=2012, username="admin", password="secret")
+client = BoltClient(host="localhost", port=8518, username="admin", password="secret")
 client.connect()
 coord = TaskCoordinator(client)
 
@@ -98,7 +98,7 @@ Examples:
 """
 
 openai_client = OpenAI()
-client = BoltClient(host="localhost", port=2012, username="admin", password="secret")
+client = BoltClient(host="localhost", port=8518, username="admin", password="secret")
 client.connect()
 coord = TaskCoordinator(client)
 
@@ -129,7 +129,7 @@ def process_user_request(user_input: str) -> list[Task]:
 from bolt_client import BoltClient
 from bolt_agents import TaskCoordinator
 
-client = BoltClient(host="localhost", port=2012, username="admin", password="secret")
+client = BoltClient(host="localhost", port=8518, username="admin", password="secret")
 client.connect()
 coord = TaskCoordinator(client)
 
@@ -160,7 +160,7 @@ def run_pipeline(query: str):
 from bolt_client import BoltClient
 from bolt_agents import TaskCoordinator, Task
 
-client = BoltClient(host="localhost", port=2012, username="admin", password="secret")
+client = BoltClient(host="localhost", port=8518, username="admin", password="secret")
 client.connect()
 coord = TaskCoordinator(client)
 
@@ -182,7 +182,7 @@ coord.subscribe("research", agent_id="research_agent_01", callback=handle_resear
 from bolt_client import BoltClient
 from bolt_agents import TaskCoordinator, Task
 
-client = BoltClient(host="localhost", port=2012, username="admin", password="secret")
+client = BoltClient(host="localhost", port=8518, username="admin", password="secret")
 client.connect()
 coord = TaskCoordinator(client)
 
@@ -305,7 +305,7 @@ This installs `bolt` (server) and `boltctl` (CLI) to `/usr/local/bin`.
 ### Docker
 
 ```bash
-docker run -p 2012:2012 cloud55io/bolt
+docker run -p 8518:8518 cloud55io/bolt
 ```
 
 ### From Source
@@ -344,7 +344,7 @@ from bolt_client import BoltClient
 
 client = BoltClient(
     host="127.0.0.1",
-    port=2012,
+    port=8518,
     username="admin",
     password="secret"
 )
@@ -390,7 +390,7 @@ client.close()
 ### Context Manager
 
 ```python
-with BoltClient(host="127.0.0.1", port=2012, username="admin", password="secret") as client:
+with BoltClient(host="127.0.0.1", port=8518, username="admin", password="secret") as client:
     client.put("key", "value")
 # Connection automatically closed
 ```
@@ -399,7 +399,7 @@ with BoltClient(host="127.0.0.1", port=2012, username="admin", password="secret"
 
 ```python
 client = BoltClient.cluster(
-    nodes=["192.168.1.10:2012", "192.168.1.11:2012", "192.168.1.12:2012"],
+    nodes=["192.168.1.10:8518", "192.168.1.11:8518", "192.168.1.12:8518"],
     username="admin",
     password="secret"
 )
@@ -420,7 +420,7 @@ with client:
 |----------|-------------|---------|
 | **Server** | | |
 | `BOLT_HOST` | Listen address | `0.0.0.0` |
-| `BOLT_PORT` | Client port | `2012` |
+| `BOLT_PORT` | Client port | `8518` |
 | `BOLT_DATA_DIR` | Data directory | `/data` |
 | `BOLT_PERSIST` | Enable persistence | `true` |
 | `BOLT_MAX_CONNECTIONS` | Max concurrent connections | `1000` |
@@ -435,7 +435,7 @@ with client:
 | `BOLT_MEMORY_WARNING_THRESHOLD` | Warning at % | `90` |
 | **Cluster** | | |
 | `BOLT_NODE_ID` | Unique node identifier | - |
-| `BOLT_CLUSTER_PORT` | Cluster communication port | `2013` |
+| `BOLT_CLUSTER_PORT` | Cluster communication port | `8519` |
 | `BOLT_CLUSTER_PEERS` | Peer list `id:host:port,...` | - |
 | **Security** | | |
 | `BOLT_ADMIN_PASSWORD` | Admin user password | - |
@@ -484,31 +484,31 @@ services:
   bolt-node1:
     image: bolt:latest
     ports:
-      - "2012:2012"
+      - "8518:8518"
     environment:
       - BOLT_NODE_ID=node1
-      - BOLT_CLUSTER_PORT=2013
-      - BOLT_CLUSTER_PEERS=node2:bolt-node2:2013,node3:bolt-node3:2013
+      - BOLT_CLUSTER_PORT=8519
+      - BOLT_CLUSTER_PEERS=node2:bolt-node2:8519,node3:bolt-node3:8519
       - BOLT_ADMIN_PASSWORD=admin
 
   bolt-node2:
     image: bolt:latest
     ports:
-      - "2022:2012"
+      - "8528:8518"
     environment:
       - BOLT_NODE_ID=node2
-      - BOLT_CLUSTER_PORT=2013
-      - BOLT_CLUSTER_PEERS=node1:bolt-node1:2013,node3:bolt-node3:2013
+      - BOLT_CLUSTER_PORT=8519
+      - BOLT_CLUSTER_PEERS=node1:bolt-node1:8519,node3:bolt-node3:8519
       - BOLT_ADMIN_PASSWORD=admin
 
   bolt-node3:
     image: bolt:latest
     ports:
-      - "2032:2012"
+      - "8538:8518"
     environment:
       - BOLT_NODE_ID=node3
-      - BOLT_CLUSTER_PORT=2013
-      - BOLT_CLUSTER_PEERS=node1:bolt-node1:2013,node2:bolt-node2:2013
+      - BOLT_CLUSTER_PORT=8519
+      - BOLT_CLUSTER_PEERS=node1:bolt-node1:8519,node2:bolt-node2:8519
       - BOLT_ADMIN_PASSWORD=admin
 ```
 
@@ -527,7 +527,7 @@ Bolt handles node failures gracefully:
 ```bash
 # Environment
 export BOLT_HOST=127.0.0.1
-export BOLT_PORT=2012
+export BOLT_PORT=8518
 export BOLT_USER=admin
 export BOLT_PASSWORD=secret
 
@@ -613,7 +613,7 @@ bolt-ctl stats
 ```bash
 docker run -d \
   --name bolt \
-  -p 2012:2012 \
+  -p 8518:8518 \
   -v bolt_data:/data \
   -e BOLT_ADMIN_PASSWORD=secret \
   -e BOLT_MAX_MEMORY=1gb \

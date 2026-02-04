@@ -120,7 +120,7 @@ def print_progress(stats: Stats, final: bool = False):
 
 def run_load_test(
     host: str = "127.0.0.1",
-    port: int = 2012,
+    port: int = 8518,
     username: str = "admin",
     password: str = "admin",
     total_records: int = 500_000,
@@ -212,7 +212,7 @@ def run_load_test(
 
 def cleanup(
     host: str = "127.0.0.1",
-    port: int = 2012,
+    port: int = 8518,
     username: str = "admin",
     password: str = "admin",
     prefix: str = "loadtest"
@@ -241,7 +241,7 @@ def cleanup(
 
 def cleanup_all_loadtests(
     host: str = "127.0.0.1",
-    port: int = 2012,
+    port: int = 8518,
     username: str = "admin",
     password: str = "admin"
 ):
@@ -273,7 +273,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Bolt Load Test (Batch Mode)")
     parser.add_argument("--host", default="127.0.0.1", help="Bolt server host")
-    parser.add_argument("--port", type=int, default=2012, help="Bolt server port")
+    parser.add_argument("--port", type=int, default=8518, help="Bolt server port")
     parser.add_argument("--username", default="admin", help="Username")
     parser.add_argument("--password", default="admin", help="Password")
     parser.add_argument("--records", type=int, default=500_000, help="Number of records")
