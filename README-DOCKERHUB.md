@@ -39,14 +39,14 @@ docker run -d \
   cloud55io/bolt:0.0.5
 ```
 
-### Connect with bolt-ctl
+### Connect with boltctl
 
 ```bash
-# Using bolt-ctl (included in container)
-docker exec -it bolt bolt-ctl put hello world
-docker exec -it bolt bolt-ctl get hello
-docker exec -it bolt bolt-ctl stats
-docker exec -it bolt bolt-ctl keys "*"
+# Using boltctl (included in container)
+docker exec -it bolt boltctl put hello world
+docker exec -it bolt boltctl get hello
+docker exec -it bolt boltctl stats
+docker exec -it bolt boltctl keys "*"
 ```
 
 ### Check metrics
@@ -164,7 +164,7 @@ volumes:
 | `BOLT_TLS_CERT` | - | Path to TLS certificate |
 | `BOLT_TLS_KEY` | - | Path to TLS private key |
 
-## Supported Commands (bolt-ctl)
+## Supported Commands (boltctl)
 
 ### Strings
 - `put key value` / `get key` / `del key`

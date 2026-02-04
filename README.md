@@ -532,46 +532,46 @@ export BOLT_USER=admin
 export BOLT_PASSWORD=secret
 
 # Key-Value
-bolt-ctl put <key> <value>
-bolt-ctl get <key>
-bolt-ctl del <key>
+boltctl put <key> <value>
+boltctl get <key>
+boltctl del <key>
 
 # TTL
-bolt-ctl setex <key> <ttl_seconds> <value>
-bolt-ctl ttl <key>
+boltctl setex <key> <ttl_seconds> <value>
+boltctl ttl <key>
 
 # Batch
-bolt-ctl mset <k1> <v1> <k2> <v2> ...
-bolt-ctl mget <k1> <k2> ...
-bolt-ctl mdel <k1> <k2> ...
+boltctl mset <k1> <v1> <k2> <v2> ...
+boltctl mget <k1> <k2> ...
+boltctl mdel <k1> <k2> ...
 
 # Counters
-bolt-ctl incr <key>
-bolt-ctl decr <key>
-bolt-ctl incrby <key> <delta>
+boltctl incr <key>
+boltctl decr <key>
+boltctl incrby <key> <delta>
 
 # CRDT Counters (cluster-safe)
-bolt-ctl cincr <key>
-bolt-ctl cdecr <key>
-bolt-ctl cget <key>
+boltctl cincr <key>
+boltctl cdecr <key>
+boltctl cget <key>
 
 # Lists
-bolt-ctl rpush <key> <val1> [val2...]
-bolt-ctl lpush <key> <val1> [val2...]
-bolt-ctl lpop <key>
-bolt-ctl rpop <key>
-bolt-ctl lrange <key> <start> <stop>
+boltctl rpush <key> <val1> [val2...]
+boltctl lpush <key> <val1> [val2...]
+boltctl lpop <key>
+boltctl rpop <key>
+boltctl lrange <key> <start> <stop>
 
 # Sets
-bolt-ctl sadd <key> <member1> [member2...]
-bolt-ctl srem <key> <member1> [member2...]
-bolt-ctl smembers <key>
-bolt-ctl sismember <key> <member>
+boltctl sadd <key> <member1> [member2...]
+boltctl srem <key> <member1> [member2...]
+boltctl smembers <key>
+boltctl sismember <key> <member>
 
 # Server
-bolt-ctl stats
-bolt-ctl metrics
-bolt-ctl cluster
+boltctl stats
+boltctl metrics
+boltctl cluster
 ```
 
 ---
@@ -601,7 +601,7 @@ curl http://localhost:9091/metrics
 curl http://localhost:9091/health
 
 # CLI
-bolt-ctl stats
+boltctl stats
 ```
 
 ---

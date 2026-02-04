@@ -98,13 +98,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bolt-ctl"
-version = "0.1.0"
-dependencies = [
- "byteordered",
-]
-
-[[package]]
 name = "bolt-server"
 version = "0.1.0"
 dependencies = [
@@ -115,6 +108,13 @@ dependencies = [
  "server",
  "tikv-jemallocator",
  "tokio",
+]
+
+[[package]]
+name = "boltctl"
+version = "0.1.0"
+dependencies = [
+ "byteordered",
 ]
 
 [[package]]

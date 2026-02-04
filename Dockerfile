@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy binaries from builder
 COPY --from=builder /app/target/release/bolt-server /usr/local/bin/
-COPY --from=builder /app/target/release/bolt-ctl /usr/local/bin/
+COPY --from=builder /app/target/release/boltctl /usr/local/bin/
 
 # Create data directory
 RUN mkdir -p /data && chown bolt:bolt /data
