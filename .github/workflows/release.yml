@@ -103,3 +103,68 @@ jobs:
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Docker ${{ matrix.platform }}
+    needs: release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push (per-platform)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: cloud55io/bolt:${{ github.ref_name }}-${{ matrix.suffix }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+  docker-manifest:
+    name: Docker Multi-Arch Manifest
+    needs: docker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+
+          # Create manifest for version tag (e.g. v0.4.0)
+          docker manifest create cloud55io/bolt:${TAG} \
+            cloud55io/bolt:${TAG}-amd64 \
+            cloud55io/bolt:${TAG}-arm64
+          docker manifest push cloud55io/bolt:${TAG}
+
+          # Create manifest for latest
+          docker manifest create cloud55io/bolt:latest \
+            cloud55io/bolt:${TAG}-amd64 \
+            cloud55io/bolt:${TAG}-arm64
+          docker manifest push cloud55io/bolt:latest
