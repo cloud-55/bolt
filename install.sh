@@ -165,12 +165,12 @@ main() {
         cat > "$config_file" << 'EOF'
 host = "127.0.0.1"
 port = 8518
-username = "admin"
-password = "admin"
 EOF
         chmod 600 "$config_file"
-        success "Config created with default credentials (admin/admin)"
-        warn "Change password with: boltctl passwd admin <new_password>"
+        success "Config created at $config_file"
+        info "After starting the server, login with: boltctl login"
+        info "The admin password is shown in the server log on first start"
+        info "Set BOLT_ADMIN_PASSWORD env var to choose your own password"
     else
         info "Config file already exists at $config_file"
     fi
@@ -213,8 +213,9 @@ EOF
     echo "  boltctl get key         # Retrieve a value"
     echo ""
     echo "Authentication:"
-    echo "  Credentials are saved in ~/.boltrc (default: admin/admin)"
-    echo "  Change password: boltctl passwd admin <new_password>"
+    echo "  Start the server and check the log for the admin password"
+    echo "  Login: boltctl login"
+    echo "  Or set BOLT_ADMIN_PASSWORD env var before starting the server"
     echo ""
     echo "Documentation: https://github.com/${REPO}"
     echo ""

@@ -1,11 +1,13 @@
 use storage::{Storage, StorageConfig, DatabaseId, current_timestamp_ms, EvictionPolicy, format_bytes};
+use std::collections::HashMap;
 use std::env;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use log::info;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
 use crate::auth::{UserStore, Session, UserRole, AuthError};
@@ -17,6 +19,56 @@ use crate::pubsub::{SubscriptionManager, Task, TaskStatus, Notification};
 use crate::tls::TlsConfig;
 use crate::http_metrics::HttpMetricsServer;
 use cluster::{ClusterConfig, ClusterManager, ReplicationEntry, ReplicationOp};
+
+const MAX_AUTH_ATTEMPTS: u32 = 5;
+const AUTH_WINDOW_SECS: u64 = 300; // 5 minutes
+
+struct AuthRateLimiter {
+    attempts: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+impl AuthRateLimiter {
+    fn new() -> Self {
+        AuthRateLimiter {
+            attempts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record a failed auth attempt and return delay to apply (if any).
+    async fn record_failure(&self, addr: IpAddr) -> Option<Duration> {
+        let mut attempts = self.attempts.lock().await;
+        let now = Instant::now();
+
+        let (count, first_attempt) = attempts
+            .entry(addr)
+            .or_insert((0, now));
+
+        // Reset if window expired
+        if now.duration_since(*first_attempt).as_secs() > AUTH_WINDOW_SECS {
+            *count = 0;
+            *first_attempt = now;
+        }
+
+        *count += 1;
+        let count = *count;
+
+        if count >= MAX_AUTH_ATTEMPTS {
+            // Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped at 16s)
+            let delay_secs = 1u64 << (count - MAX_AUTH_ATTEMPTS).min(4);
+            log::warn!("Auth failed from {} ({} attempts), delay {}s", addr, count, delay_secs);
+            Some(Duration::from_secs(delay_secs))
+        } else {
+            log::warn!("Auth failed from {} ({} attempts)", addr, count);
+            None
+        }
+    }
+
+    /// Clear attempts on successful auth.
+    async fn record_success(&self, addr: IpAddr) {
+        let mut attempts = self.attempts.lock().await;
+        attempts.remove(&addr);
+    }
+}
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: &str = "8518";
@@ -33,10 +85,12 @@ pub struct Server {
     max_connections: usize,
     cluster: Option<Arc<ClusterManager>>,
     pubsub: Arc<SubscriptionManager>,
+    rate_limiter: Arc<AuthRateLimiter>,
+    auth_enabled: bool,
 }
 
 impl Server {
-    pub fn new() -> Result<Self, ServerError> {
+    pub async fn new() -> Result<Self, ServerError> {
         let host = env::var("BOLT_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
         let port_str = env::var("BOLT_PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
         let port = port_str.parse::<u16>()
@@ -129,6 +183,11 @@ impl Server {
             info!("Memory limit: unlimited (no eviction)");
         }
 
+        // Authentication mode
+        let auth_enabled = env::var("BOLT_AUTH")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+
         // User authentication configuration
         let users_file = format!("{}/users.json", data_dir);
         let user_store = if persistence_enabled {
@@ -137,34 +196,43 @@ impl Server {
             UserStore::new()
         };
 
-        // Create default admin user if no users exist
-        let default_admin_password = env::var("BOLT_ADMIN_PASSWORD")
-            .unwrap_or_else(|_| "admin".to_string());
-        let is_default_password = default_admin_password == "admin";
+        if auth_enabled {
+            // Create default admin user if no users exist
+            let (default_admin_password, is_generated) = match env::var("BOLT_ADMIN_PASSWORD") {
+                Ok(pw) => (pw, false),
+                Err(_) => {
+                    use rand::Rng;
+                    let password: String = rand::thread_rng()
+                        .sample_iter(&rand::distributions::Alphanumeric)
+                        .take(16)
+                        .map(char::from)
+                        .collect();
+                    (password, true)
+                }
+            };
+            let is_default_password = default_admin_password == "admin";
 
-        // We need to run this in a blocking context since we're in a sync function
-        let user_store_clone = user_store.clone();
-        let created_admin = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                user_store_clone.ensure_default_admin(&default_admin_password).await
-            })
-        }).join().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to create admin user"))??;
+            let created_admin = user_store.ensure_default_admin(&default_admin_password).await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to create admin user"))?;
 
-        if created_admin {
-            info!("Created default admin user (username: admin, password: {})",
-                  if is_default_password { "admin - CHANGE THIS!" } else { "****" });
-        }
-
-        let user_count = std::thread::spawn({
-            let user_store = user_store.clone();
-            move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async { user_store.user_count().await })
+            if created_admin {
+                if is_generated {
+                    info!("=========================================");
+                    info!("  GENERATED admin password: {}", default_admin_password);
+                    info!("  Set BOLT_ADMIN_PASSWORD to change it");
+                    info!("=========================================");
+                } else if is_default_password {
+                    log::warn!("Using default admin password 'admin' - CHANGE THIS IN PRODUCTION!");
+                } else {
+                    info!("Created default admin user (username: admin, password: ****)");
+                }
             }
-        }).join().unwrap_or(0);
 
-        info!("Authentication enabled ({} users configured)", user_count);
+            let user_count = user_store.user_count().await;
+            info!("Authentication enabled ({} users configured)", user_count);
+        } else {
+            log::warn!("Authentication DISABLED (BOLT_AUTH=false) - all connections have full admin access");
+        }
 
         // TLS configuration
         let tls_acceptor = if let Some(tls_config) = TlsConfig::from_env() {
@@ -203,6 +271,8 @@ impl Server {
             max_connections,
             cluster,
             pubsub: Arc::new(SubscriptionManager::new()),
+            rate_limiter: Arc::new(AuthRateLimiter::new()),
+            auth_enabled,
         })
     }
 
@@ -290,6 +360,8 @@ impl Server {
                             let max_connections = self.max_connections;
                             let cluster = self.cluster.clone();
                             let pubsub = self.pubsub.clone();
+                            let rate_limiter = self.rate_limiter.clone();
+                            let auth_enabled = self.auth_enabled;
 
                             metrics.active_connections.fetch_add(1, Ordering::SeqCst);
                             metrics.total_connections.fetch_add(1, Ordering::SeqCst);
@@ -300,7 +372,7 @@ impl Server {
                                     // TLS connection
                                     match acceptor.accept(stream).await {
                                         Ok(tls_stream) => {
-                                            handle_client(tls_stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster, pubsub).await
+                                            handle_client(tls_stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster, pubsub, peer_addr, rate_limiter, auth_enabled).await
                                         }
                                         Err(e) => {
                                             info!("TLS handshake failed: {}", e);
@@ -309,7 +381,7 @@ impl Server {
                                     }
                                 } else {
                                     // Plain TCP connection
-                                    handle_client(stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster, pubsub).await
+                                    handle_client(stream, storage, &mut client_shutdown_rx, user_store, metrics.clone(), cluster, pubsub, peer_addr, rate_limiter, auth_enabled).await
                                 };
 
                                 metrics.active_connections.fetch_sub(1, Ordering::SeqCst);
@@ -360,28 +432,36 @@ async fn handle_client<S>(
     metrics: Arc<Metrics>,
     cluster: Option<Arc<ClusterManager>>,
     pubsub: Arc<SubscriptionManager>,
+    peer_addr: SocketAddr,
+    rate_limiter: Arc<AuthRateLimiter>,
+    auth_enabled: bool,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let mut session = Session::new();
 
-    // Authenticate the client first
-    match authenticate_client(&mut stream, &user_store, shutdown_rx).await {
-        Ok(Some(user)) => {
-            session.authenticate(user);
-            info!("Client authenticated as '{}'", session.username().unwrap_or("unknown"));
-        }
-        Ok(None) => {
-            info!("Authentication failed, closing connection");
-            return Ok(());
-        }
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+    if auth_enabled {
+        // Authenticate the client first
+        match authenticate_client(&mut stream, &user_store, shutdown_rx, peer_addr, &rate_limiter).await {
+            Ok(Some(user)) => {
+                session.authenticate(user);
+                info!("Client authenticated as '{}'", session.username().unwrap_or("unknown"));
+            }
+            Ok(None) => {
+                info!("Authentication failed, closing connection");
                 return Ok(());
             }
-            return Err(e);
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Ok(());
+                }
+                return Err(e);
+            }
         }
+    } else {
+        // No-auth mode: synthetic admin session
+        session.authenticate(Session::anonymous_admin());
     }
 
     // Create notification channel for Pub/Sub
@@ -454,6 +534,8 @@ async fn authenticate_client<S>(
     stream: &mut S,
     user_store: &UserStore,
     shutdown_rx: &mut broadcast::Receiver<()>,
+    peer_addr: SocketAddr,
+    rate_limiter: &AuthRateLimiter,
 ) -> std::io::Result<Option<crate::auth::User>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -490,6 +572,7 @@ where
                     // Authenticate with user store
                     match user_store.authenticate(username, password).await {
                         Ok(user) => {
+                            rate_limiter.record_success(peer_addr.ip()).await;
                             let response = Message {
                                 code: OP_AUTH_OK,
                                 key: user.username.clone(),
@@ -501,6 +584,9 @@ where
                             Ok(Some(user))
                         }
                         Err(AuthError::InvalidCredentials) => {
+                            if let Some(delay) = rate_limiter.record_failure(peer_addr.ip()).await {
+                                tokio::time::sleep(delay).await;
+                            }
                             let response = Message {
                                 code: OP_AUTH_FAIL,
                                 key: String::new(),
@@ -512,6 +598,9 @@ where
                             Ok(None)
                         }
                         Err(e) => {
+                            if let Some(delay) = rate_limiter.record_failure(peer_addr.ip()).await {
+                                tokio::time::sleep(delay).await;
+                            }
                             let response = Message {
                                 code: OP_AUTH_FAIL,
                                 key: String::new(),
@@ -575,6 +664,19 @@ where
         return Ok(());
     }
     match message.code {
+        OP_AUTH => {
+            // Gracefully handle auth messages in no-auth mode or re-auth attempts
+            let response = Message {
+                code: OP_AUTH_OK,
+                key: session.username().unwrap_or("anonymous").to_string(),
+                value: format!("Authenticated as {} (role: {})",
+                    session.username().unwrap_or("anonymous"),
+                    session.role().map(|r| r.as_str()).unwrap_or("admin")),
+                not_found: false,
+                database_id: DatabaseId::Default,
+            };
+            response.send_async(stream).await?;
+        }
         OP_DB_SWITCH => {
             info!("Switched to database: {:?}", message.database_id);
         }
@@ -600,7 +702,7 @@ where
                 cluster_mgr.replicate_async(entry);
             }
 
-            info!("OK PUT {} {}", key, value);
+            info!("OK PUT {}", key);
 
             // Send response back to client
             let response = Message {
@@ -652,7 +754,7 @@ where
                 cluster_mgr.replicate_async(entry);
             }
 
-            info!("OK SETEX {} {} (TTL: {}s)", key, actual_value, ttl_secs);
+            info!("OK SETEX {} (TTL: {}s)", key, ttl_secs);
 
             // Send response back to client
             let response = Message {
@@ -701,12 +803,10 @@ where
             let entries = storage.get_all_entries(message.database_id.clone()).await;
             match entries {
                 Some(entries) => {
-                    for (key, value) in entries.iter() {
-                        info!("Key: {}, Value: {}", key, value);
-                    }
+                    info!("OK GET_ALL: {} entries", entries.len());
                 }
                 None => {
-                    info!("DATABASE IS EMPTY");
+                    info!("OK GET_ALL: empty");
                 }
             }
         }
@@ -719,7 +819,7 @@ where
 
             let response = match value {
                 Some(value) => {
-                    info!("OK GET {} {}", key, value);
+                    info!("OK GET {}", key);
                     Message {
                         code: OP_GET,
                         key: key.clone(),
@@ -871,7 +971,7 @@ where
 
             let response = match value {
                 Some(value) => {
-                    info!("OK DEL {} {}", key, value);
+                    info!("OK DEL {}", key);
                     Message {
                         code: OP_DEL,
                         key: key.clone(),
@@ -948,7 +1048,7 @@ where
                 cluster_mgr.replicate_async(entry);
             }
 
-            info!("OK INCR {} = {}", key, new_value);
+            info!("OK INCR {}", key);
             let response = Message {
                 code: OP_INCR,
                 key: key.clone(),
@@ -978,7 +1078,7 @@ where
                 cluster_mgr.replicate_async(entry);
             }
 
-            info!("OK DECR {} = {}", key, new_value);
+            info!("OK DECR {}", key);
             let response = Message {
                 code: OP_DECR,
                 key: key.clone(),
@@ -1009,7 +1109,7 @@ where
                 cluster_mgr.replicate_async(entry);
             }
 
-            info!("OK INCRBY {} {} = {}", key, delta, new_value);
+            info!("OK INCRBY {} delta={}", key, delta);
             let response = Message {
                 code: OP_INCRBY,
                 key: key.clone(),
@@ -1050,7 +1150,7 @@ where
                 }
             }
 
-            info!("OK CINCR {} = {}", key, new_value);
+            info!("OK CINCR {}", key);
             let response = Message {
                 code: OP_CINCR,
                 key: key.clone(),
@@ -1090,7 +1190,7 @@ where
                 }
             }
 
-            info!("OK CDECR {} = {}", key, new_value);
+            info!("OK CDECR {}", key);
             let response = Message {
                 code: OP_CDECR,
                 key: key.clone(),
@@ -1110,7 +1210,7 @@ where
                 None => (String::new(), true),
             };
 
-            info!("OK CGET {} = {:?}", key, value);
+            info!("OK CGET {}", key);
             let response = Message {
                 code: OP_CGET,
                 key: key.clone(),
@@ -1151,7 +1251,7 @@ where
                 }
             }
 
-            info!("OK CINCRBY {} {} = {}", key, amount, new_value);
+            info!("OK CINCRBY {} amount={}", key, amount);
             let response = Message {
                 code: OP_CINCRBY,
                 key: key.clone(),
@@ -1243,7 +1343,7 @@ where
 
             let response = match value {
                 Some(v) => {
-                    info!("OK LPOP {} = {}", key, v);
+                    info!("OK LPOP {}", key);
                     Message {
                         code: OP_LPOP,
                         key: key.clone(),
@@ -1282,7 +1382,7 @@ where
 
             let response = match value {
                 Some(v) => {
-                    info!("OK RPOP {} = {}", key, v);
+                    info!("OK RPOP {}", key);
                     Message {
                         code: OP_RPOP,
                         key: key.clone(),

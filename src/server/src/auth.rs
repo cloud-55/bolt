@@ -307,6 +307,15 @@ impl Session {
     pub fn role(&self) -> Option<&UserRole> {
         self.user.as_ref().map(|u| &u.role)
     }
+
+    /// Create a synthetic admin user for no-auth mode.
+    pub fn anonymous_admin() -> User {
+        User {
+            username: "anonymous".to_string(),
+            password_hash: String::new(),
+            role: UserRole::Admin,
+        }
+    }
 }
 
 impl Default for Session {

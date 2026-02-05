@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt as TokioAsyncReadExt, AsyncW
 /// 7. value (bytes)
 
 const HEADER_SIZE: usize = 2 + 4 + 4 + 4; // code + db_id_len + key_len + value_len
+const MAX_MESSAGE_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -59,6 +60,15 @@ impl Message {
         let database_id_length = stream.read_u32::<BigEndian>()?;
         let key_length = stream.read_u32::<BigEndian>()?;
         let value_length = stream.read_u32::<BigEndian>()?;
+
+        // Validate total message size to prevent OOM attacks
+        let total_size = database_id_length as u64 + key_length as u64 + value_length as u64;
+        if total_size > MAX_MESSAGE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message too large: {} bytes (max: {} bytes)", total_size, MAX_MESSAGE_SIZE),
+            ));
+        }
 
         // Read body
         let database_id = if database_id_length > 0 {
@@ -137,6 +147,15 @@ impl Message {
             let value_length = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)?;
             (code, database_id_length, key_length, value_length)
         };
+
+        // Validate total message size to prevent OOM attacks
+        let total_size = database_id_length as u64 + key_length as u64 + value_length as u64;
+        if total_size > MAX_MESSAGE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message too large: {} bytes (max: {} bytes)", total_size, MAX_MESSAGE_SIZE),
+            ));
+        }
 
         // Read body
         let database_id = if database_id_length > 0 {

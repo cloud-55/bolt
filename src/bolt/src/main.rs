@@ -24,7 +24,7 @@ High-performance in-memory key-value database
 
     println!("{}", ascii_logo);
 
-    let server = match server::Server::new() {
+    let server = match server::Server::new().await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to initialize server: {}", e);
