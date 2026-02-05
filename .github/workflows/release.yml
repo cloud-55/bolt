@@ -153,18 +153,19 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Create and push multi-arch manifest
         run: |
           TAG="${GITHUB_REF_NAME}"
 
-          # Create manifest for version tag (e.g. v0.4.0)
-          docker manifest create cloud55io/bolt:${TAG} \
+          # Create version tag multi-arch manifest
+          docker buildx imagetools create -t cloud55io/bolt:${TAG} \
             cloud55io/bolt:${TAG}-amd64 \
             cloud55io/bolt:${TAG}-arm64
-          docker manifest push cloud55io/bolt:${TAG}
 
-          # Create manifest for latest
-          docker manifest create cloud55io/bolt:latest \
+          # Create latest tag multi-arch manifest
+          docker buildx imagetools create -t cloud55io/bolt:latest \
             cloud55io/bolt:${TAG}-amd64 \
             cloud55io/bolt:${TAG}-arm64
-          docker manifest push cloud55io/bolt:latest
