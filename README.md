@@ -299,7 +299,7 @@ curl -X POST http://localhost:8000/tasks -H "Content-Type: application/json" \
 ### Quick Install (Linux/macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cloud-55/bolt/main/install.sh | bash
+BOLT_AUTH=false BOLT_START=true bash -c "$(curl -fsSL https://raw.githubusercontent.com/cloud-55/bolt/main/install.sh)"
 ```
 
 This installs `bolt` (server) and `boltctl` (CLI) to `/usr/local/bin`.
@@ -484,7 +484,7 @@ version: '3.8'
 
 services:
   bolt-node1:
-    image: bolt:latest
+    image: cloud55io/bolt:latest
     ports:
       - "8518:8518"
     environment:
@@ -494,7 +494,7 @@ services:
       - BOLT_ADMIN_PASSWORD=admin
 
   bolt-node2:
-    image: bolt:latest
+    image: cloud55io/bolt:latest
     ports:
       - "8528:8518"
     environment:
@@ -504,7 +504,7 @@ services:
       - BOLT_ADMIN_PASSWORD=admin
 
   bolt-node3:
-    image: bolt:latest
+    image: cloud55io/bolt:latest
     ports:
       - "8538:8518"
     environment:
@@ -617,15 +617,15 @@ docker run -d \
   --name bolt \
   -p 8518:8518 \
   -v bolt_data:/data \
-  -e BOLT_ADMIN_PASSWORD=secret \
-  -e BOLT_MAX_MEMORY=1gb \
-  bolt:latest
+  -e BOLT_PERSIST=true \
+  -e BOLT_AUTH=false \
+  cloud55io/bolt
 ```
 
 ### Build from Source
 
 ```bash
-docker build -t bolt:latest .
+docker build -t cloud55io/bolt .
 ```
 
 ---
