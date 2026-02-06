@@ -4,7 +4,7 @@ services:
   # Single node setup (default)
   bolt:
     build: .
-    image: bolt:latest
+    image: cloud55io/bolt:latest
     container_name: bolt
     ports:
       - "8518:8518"
@@ -15,9 +15,7 @@ services:
       - BOLT_PORT=8518
       - BOLT_DATA_DIR=/data
       - BOLT_PERSIST=true
-      - BOLT_HIGH_PERF=true
-      - BOLT_ADMIN_PASSWORD=admin
-      - RUST_LOG=info
+      - BOLT_AUTH=false
     restart: unless-stopped
     profiles:
       - single

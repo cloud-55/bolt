@@ -6,7 +6,7 @@ version: '3.8'
 services:
   bolt-node1:
     build: .
-    image: bolt:latest
+    image: cloud55io/bolt:latest
     container_name: bolt-node1
     hostname: bolt-node1
     ports:
@@ -21,7 +21,7 @@ services:
       - BOLT_DATA_DIR=/data
       - BOLT_PERSIST=true
       - BOLT_HIGH_PERF=true
-      - BOLT_ADMIN_PASSWORD=admin
+      - BOLT_AUTH=false
       - BOLT_NODE_ID=node1
       - BOLT_CLUSTER_PORT=8519
       - BOLT_CLUSTER_PEERS=node2:bolt-node2:8519,node3:bolt-node3:8519
@@ -32,7 +32,7 @@ services:
 
   bolt-node2:
     build: .
-    image: bolt:latest
+    image: cloud55io/bolt:latest
     container_name: bolt-node2
     hostname: bolt-node2
     ports:
@@ -47,7 +47,7 @@ services:
       - BOLT_DATA_DIR=/data
       - BOLT_PERSIST=true
       - BOLT_HIGH_PERF=true
-      - BOLT_ADMIN_PASSWORD=admin
+      - BOLT_AUTH=false
       - BOLT_NODE_ID=node2
       - BOLT_CLUSTER_PORT=8519
       - BOLT_CLUSTER_PEERS=node1:bolt-node1:8519,node3:bolt-node3:8519
@@ -60,7 +60,7 @@ services:
 
   bolt-node3:
     build: .
-    image: bolt:latest
+    image: cloud55io/bolt:latest
     container_name: bolt-node3
     hostname: bolt-node3
     ports:
@@ -75,7 +75,7 @@ services:
       - BOLT_DATA_DIR=/data
       - BOLT_PERSIST=true
       - BOLT_HIGH_PERF=true
-      - BOLT_ADMIN_PASSWORD=admin
+      - BOLT_AUTH=false
       - BOLT_NODE_ID=node3
       - BOLT_CLUSTER_PORT=8519
       - BOLT_CLUSTER_PEERS=node1:bolt-node1:8519,node2:bolt-node2:8519
